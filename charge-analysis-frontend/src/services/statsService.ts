@@ -1,4 +1,4 @@
-import { querySupabase } from '../lib/supabase';
+import { apiRequest } from '../lib/api';
 
 export interface SystemStats {
   totalAnalyses: number;
@@ -16,99 +16,86 @@ export interface RecentActivity {
   timestamp: string;
 }
 
+interface BackendAnalysis {
+  id: number;
+  name: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  user_id: number;
+}
+
+interface BackendCollectionSummary {
+  document_count: number;
+}
+
+const DEFAULT_STATS: SystemStats = {
+  totalAnalyses: 0,
+  completedAnalyses: 0,
+  activeUsers: 0,
+  knowledgeDocuments: 0
+};
+
 export const statsService = {
-  /**
-   * 获取系统统计数据
-   */
-  async getSystemStats(): Promise<SystemStats> {
+  async getSystemStats(token: string | null): Promise<SystemStats> {
+    if (!token) {
+      return DEFAULT_STATS;
+    }
+
     try {
-      // 并行查询所有统计数据
-      const [
-        totalAnalysesData,
-        completedAnalysesData,
-        activeUsersData,
-        knowledgeDocsData
-      ] = await Promise.all([
-        // 总分析次数
-        querySupabase('charging_analyses', 'GET'),
-        
-        // 已完成分析
-        querySupabase('charging_analyses', 'GET', {
-          filter: { status: 'completed' }
-        }),
-        
-        // 活跃用户（最近7天有活动的用户）
-        querySupabase('users', 'GET'),
-        
-        // 知识库文档数
-        querySupabase('knowledge_documents', 'GET')
-      ]);
+      const analysesPayload = await apiRequest<{ items: BackendAnalysis[] }>('/api/analyses', { token });
+      const analyses = analysesPayload.items || [];
+
+      let knowledgeDocuments = 0;
+      try {
+        const collections = await apiRequest<BackendCollectionSummary[]>('/api/rag/collections', { token });
+        knowledgeDocuments = collections.reduce((total, item) => total + (item.document_count || 0), 0);
+      } catch {
+        knowledgeDocuments = 0;
+      }
+
+      const activeUsers = new Set(analyses.map(item => item.user_id)).size || 1;
+      const completedAnalyses = analyses.filter(item => item.status === 'completed').length;
 
       return {
-        totalAnalyses: totalAnalysesData.length,
-        completedAnalyses: completedAnalysesData.length,
-        activeUsers: activeUsersData.length,
-        knowledgeDocuments: knowledgeDocsData.length
+        totalAnalyses: analyses.length,
+        completedAnalyses,
+        activeUsers,
+        knowledgeDocuments
       };
     } catch (error) {
       console.error('获取系统统计失败:', error);
-      // 返回默认值
-      return {
-        totalAnalyses: 0,
-        completedAnalyses: 0,
-        activeUsers: 0,
-        knowledgeDocuments: 0
-      };
+      return DEFAULT_STATS;
     }
   },
 
-  /**
-   * 获取最近活动记录
-   */
-  async getRecentActivities(limit: number = 10): Promise<RecentActivity[]> {
+  async getRecentActivities(
+    token: string | null,
+    currentUserName: string,
+    limit: number = 10
+  ): Promise<RecentActivity[]> {
+    if (!token) {
+      return [];
+    }
+
     try {
-      // 查询审计日志获取最近活动
-      const auditLogs = await querySupabase('audit_logs', 'GET', {
-        order: { column: 'timestamp', ascending: false },
-        limit
-      });
+      const analysesPayload = await apiRequest<{ items: BackendAnalysis[] }>('/api/analyses', { token });
+      const analyses = (analysesPayload.items || [])
+        .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
+        .slice(0, limit);
 
-      // 获取相关用户信息
-      const userIds = [...new Set(auditLogs.map((log: any) => log.user_id).filter((id: any) => id))];
-      let users: any[] = [];
-      
-      if (userIds.length > 0) {
-        users = await Promise.all(
-          userIds.map((userId: number) => 
-            querySupabase('users', 'GET', {
-              filter: { id: userId },
-              single: true
-            }).catch(() => null)
-          )
-        );
-      }
-
-      const userMap = new Map(
-        users.filter(u => u).map((user: any) => [user.id, user.username || user.email])
-      );
-
-      // 转换为活动记录
-      const activities: RecentActivity[] = auditLogs.map((log: any) => {
-        const userName = userMap.get(log.user_id) || '系统';
-        const actionText = getActionText(log.action, log.resource_type);
-        const timeAgo = getTimeAgo(new Date(log.timestamp));
-
+      return analyses.map((analysis) => {
+        const action = analysis.status === 'completed' ? '完成了充电分析' : '提交了充电数据';
+        const timestamp = analysis.updated_at || analysis.created_at;
         return {
-          id: log.id,
-          type: getActivityType(log.resource_type),
-          user: userName,
-          action: actionText,
-          time: timeAgo,
-          timestamp: log.timestamp
+          id: analysis.id,
+          type: '充电分析',
+          user: currentUserName,
+          action: `${action}「${analysis.name}」`,
+          time: getTimeAgo(new Date(timestamp)),
+          timestamp
         };
       });
-
-      return activities;
     } catch (error) {
       console.error('获取最近活动失败:', error);
       return [];
@@ -116,50 +103,6 @@ export const statsService = {
   }
 };
 
-/**
- * 获取活动类型显示文本
- */
-function getActivityType(resourceType: string): string {
-  const typeMap: Record<string, string> = {
-    'charging_analysis': '充电分析',
-    'training_task': '训练任务',
-    'knowledge_document': 'RAG查询',
-    'rag_query': 'RAG查询',
-    'user': '用户管理'
-  };
-  
-  return typeMap[resourceType] || '系统操作';
-}
-
-/**
- * 获取操作文本
- */
-function getActionText(action: string, resourceType: string): string {
-  const actionMap: Record<string, string> = {
-    'CREATE': '创建了',
-    'UPDATE': '更新了',
-    'DELETE': '删除了',
-    'COMPLETE': '完成了',
-    'START': '启动了'
-  };
-
-  const resourceMap: Record<string, string> = {
-    'charging_analysis': '充电数据分析',
-    'training_task': '新的训练任务',
-    'knowledge_document': '知识库文档',
-    'rag_query': '知识库文档',
-    'user': '用户信息'
-  };
-
-  const actionText = actionMap[action] || '操作了';
-  const resourceText = resourceMap[resourceType] || resourceType;
-
-  return `${actionText}${resourceText}`;
-}
-
-/**
- * 计算时间差
- */
 function getTimeAgo(date: Date): string {
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
@@ -171,6 +114,6 @@ function getTimeAgo(date: Date): string {
   if (diffMins < 60) return `${diffMins}分钟前`;
   if (diffHours < 24) return `${diffHours}小时前`;
   if (diffDays < 7) return `${diffDays}天前`;
-  
+
   return date.toLocaleDateString('zh-CN');
 }

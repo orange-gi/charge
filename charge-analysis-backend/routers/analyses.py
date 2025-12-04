@@ -108,6 +108,27 @@ def get_analysis(analysis_id: int, user: User = Depends(get_current_user), db: S
     return AnalysisRead.model_validate(analysis)
 
 
+@router.delete("/{analysis_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_analysis(analysis_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> None:
+    analysis = (
+        db.query(ChargingAnalysis)
+        .filter(ChargingAnalysis.id == analysis_id, ChargingAnalysis.user_id == user.id)
+        .first()
+    )
+    if analysis is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析不存在")
+
+    file_path = Path(analysis.file_path)
+    db.delete(analysis)
+    db.commit()
+
+    if file_path.exists():
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
+
+
 @router.get("/{analysis_id}/results")
 def list_results(analysis_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     analysis = (
@@ -129,11 +150,13 @@ def list_results(analysis_id: int, user: User = Depends(get_current_user), db: S
         "results": [
             {
                 "id": r.id,
-                "type": r.result_type,
+                "analysis_id": r.analysis_id,
+                "result_type": r.result_type,
                 "title": r.title,
                 "content": r.content,
                 "metadata": r.metadata,
                 "confidence_score": r.confidence_score,
+                "created_at": r.created_at.isoformat(),
             }
             for r in results
         ],

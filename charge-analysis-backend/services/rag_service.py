@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import List
+from typing import List, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,19 @@ class RagService:
             session.flush()
             session.refresh(collection)
             return collection
+
+    def get_collection(self, collection_id: int) -> KnowledgeCollection | None:
+        with session_scope() as session:
+            return session.get(KnowledgeCollection, collection_id)
+
+    def list_collections(self, user_id: int | None = None) -> Sequence[KnowledgeCollection]:
+        with session_scope() as session:
+            query = session.query(KnowledgeCollection).order_by(KnowledgeCollection.created_at.desc())
+            if user_id is not None:
+                query = query.filter(
+                    (KnowledgeCollection.created_by == user_id) | (KnowledgeCollection.created_by.is_(None))
+                )
+            return query.all()
 
     def add_document_from_text(
         self,
@@ -62,6 +75,25 @@ class RagService:
             session.flush()
             session.refresh(document)
             return document
+
+    def list_documents(self, collection_id: int) -> Sequence[KnowledgeDocument]:
+        with session_scope() as session:
+            return (
+                session.query(KnowledgeDocument)
+                .filter(KnowledgeDocument.collection_id == collection_id)
+                .order_by(KnowledgeDocument.created_at.desc())
+                .all()
+            )
+
+    def list_queries(self, collection_id: int, limit: int = 50) -> Sequence[RAGQuery]:
+        with session_scope() as session:
+            return (
+                session.query(RAGQuery)
+                .filter(RAGQuery.collection_id == collection_id)
+                .order_by(RAGQuery.created_at.desc())
+                .limit(limit)
+                .all()
+            )
 
     def query(self, collection_id: int, query: str, user_id: int | None = None, limit: int = 5) -> dict:
         start = time.time()
