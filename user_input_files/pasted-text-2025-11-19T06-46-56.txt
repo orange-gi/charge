@@ -1,0 +1,361 @@
+重构以下代码，要求如下：
+1.使用前端react，后端langgraph python实现
+2.前端侧边栏包含首页，对话，充电分析，rag管理，训练管理，日志管理六个页面，提供的代码是其中的充电分析页面。
+3.新增用户注册登陆功能，管理员可以打开训练页面，rag管理页面，日志管理页面。
+4.后端langgraph，充电分析agent。架构设计：本地可以训练的1.5b流程控制模型，实时专业知识rag系统（chromadb+本地bge-base-zh-v1.5），报文处理工具，报告生成工具，OpenAI格式的LLM调用。
+5.流程：报文上传后调用报文处理工具，处理成dataframe，1.5b流程模型使用3个关键信号确定问题大方向。然后调用rag系统获取相关最新知识，以及与之相关的3个细化问题关键信号。1.5b模型再联系实际信号表现是否是推断的问题，再明确问题。最多进行3次。然后调用LLM大模型做问题总结，最终调用报告生成工具生成报告。
+6.训练功能：小模型训练支持普通数据集和思维链数据集，训练页面可以管理数据集，发布训练任务，显示训练进度，loss等关键曲线。训练版本管理，支持选择和回滚。评估训练结果。
+7.全局全框架统一的日志管理，自行选择合适的框架和合适的数据库等。
+8.后续扩展，可以在充电agent的基础上新增热管理agent，能量agent，行驶agent等。可以协同工作。这部分预留出能力，暂不实现。
+9.先给出具体的架构文档，设计文档，模块实现文档再进行具体的代码生成。
+import asyncio
+import logging
+import traceback
+from queue import Queue
+
+import httpx
+import pandas as pd
+from nicegui import ui, app, run
+
+from common.can_parse import CanParse
+import tempfile
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+
+from common.common_utils import scroll_to_bottom, promote
+
+
+class TabDiagnose:
+    def __init__(self):
+        self.signal_columns = None
+        self.chart_placeholder = None
+        self.signal_visibility = None
+        self.upload_container = None
+        self.upload_card = None
+        self.file_info_container = None
+        self.table_container = None
+        self.file_upload = None
+        self.session_id = "..."
+        self.api_response_label = None
+        self._init_page()
+        self.parser = None
+        self.queue = Queue()
+        self.running = False
+        self.process_bar = None
+        self.time_limit = 60
+        self.filter_signals = ['CHM_ComVersion', 'BMS_DCChrgSt', 'CCS_OutputCurent', 'CRM_RecognitionResult',
+                               'CRM_RegionCode', 'CRM_ChargeNo', 'CRO_ChargeReady', 'BRO_BMSChargeReady',
+                               'CML_OutputVoltageMax', 'CML_OutputCurentMax', 'CML_OutputCurentMin',
+                               'BMS_DCChrgConnectSt', 'BMS_Cc2SngR', 'BMS_ChrgASigSt', 'BMS_ChrgASigVolt',
+                               'BMS_BattCurrt', 'BCL_CurrentRequire', 'BMS_ChrgCurrtLkUp',
+                               'BMS_ChrgEndNum', 'BMS_PackSOCDisp']
+        self.chart_colors = [
+            '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+            '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+            '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'
+        ]
+        self.show_signals = ['BMS_DCChrgSt', 'BMS_BattCurrt', 'BMS_ChrgEndNum']
+        self.df_filtered = pd.DataFrame()
+
+    def _init_page(self):
+        with ui.column().classes(
+                'items-center w-full mt-6 max-w-6xl mx-auto px-6 transition-all duration-300 hidden') as self.file_info_container:
+            with ui.row().classes(
+                    'items-center justify-between w-full p-6 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-2xl shadow-sm border border-blue-100/50 backdrop-blur-sm'):
+                with ui.row().classes('items-center gap-4 flex-nowrap min-w-0'):
+                    ui.icon('description', color='primary').classes('text-2xl text-blue-600 flex-shrink-0')
+                    self.file_name_label = ui.label('').classes(
+                        'text-lg font-semibold text-gray-900 truncate bg-white/80 px-3 py-2 rounded-lg border border-blue-200/50'
+                    )
+
+                with ui.row().classes('items-center gap-3 flex-shrink-0'):
+                    self.delete_button = ui.button(
+                        icon='delete',
+                        on_click=self.delete_file,
+                        color='red'
+                    ).props('flat round').classes(
+                        'shadow-lg hover:shadow-xl transition-shadow duration-200 bg-white/90 backdrop-blur-sm').tooltip(
+                        '删除文件')
+
+                    self.bt_start = ui.button(
+                        icon='play_arrow',
+                        on_click=self.start_analysis,
+                        color='green'
+                    ).props('round').classes(
+                        'shadow-lg hover:shadow-xl transition-all duration-200 hover:scale-105 bg-gradient-to-r from-green-500 to-emerald-600 text-white').tooltip(
+                        '开始分析')
+
+            self.graph_container = ui.column().classes('w-full gap-4 hidden')
+
+            with ui.row().classes('w-full') as self.process_bar:
+                self.progressbar = ui.linear_progress(
+                    value=0,
+                    show_value=True,
+                    size='25px',
+                    color='accent'
+                ).props('instant-feedback')
+
+        with ui.column().classes('items-center w-full mt-24 max-w-md mx-auto') as self.upload_container:
+            with ui.card().classes('bg-white rounded-lg shadow-md p-8 transition-all duration-300 hover:shadow-lg '
+                                   'border-2 border-dashed border-blue-300 w-full max-w-md cursor-pointer') as self.upload_card:
+                self.upload_card.on("click", self.trigger_file_select)
+
+                with ui.column().classes('items-center w-full text-center'):
+                    ui.icon('cloud_upload', size='xl', color='blue').classes('text-4xl mb-4')
+                    ui.label('点击上传BLF文件').classes('text-xl font-semibold mb-2 text-blue-600')
+                    ui.label('或将文件拖拽到此处').classes('text-sm text-gray-500')
+
+                    self.file_upload = ui.upload(
+                        label='选择文件',
+                        auto_upload=True,
+                        on_upload=self.handle_upload
+                    ).props('accept=.blf').classes('hidden')
+
+    def trigger_file_select(self):
+        self.file_upload.run_method('pickFiles')
+
+    def handle_upload(self, e):
+        self.file_name_label.set_text(e.name)
+        ui.notify(f'文件 {e.name} 上传成功!', type='positive')
+        self.upload_card.classes(add='hidden')
+        self.file_info_container.classes(remove='hidden')
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.blf') as temp_file:
+            temp_file.write(e.content.read())
+            self.parser = CanParse(temp_file.name, self.filter_signals)
+            app.storage.tab['df_signals'] = self.parser.df_signals
+
+    def delete_file(self):
+        self.file_upload.reset()
+        ui.notify('文件已删除', type='positive')
+        self.upload_card.classes(remove='hidden')
+        self.file_info_container.classes(add='hidden')
+
+    async def start_analysis(self):
+        try:
+            timer = ui.timer(0.01, callback=lambda: self.update_progress())
+            self.progressbar.visible = True
+            self.progressbar.set_value(0)
+            self.running = True
+            self.bt_start.disable()
+
+            logging.warning('start_paly_with_progress')
+            result = await run.io_bound(self.parser.start_parse, self.queue)
+            logging.info(f'can_parse result:{result}')
+        except Exception as e:
+            logging.error(f'start play error: {e}')
+            logging.error(f'start play error: {traceback.format_exc()}')
+            ui.notify(
+                e,
+                position='center'
+            )
+        finally:
+            self.progressbar.visible = False
+            timer.cancel()
+            self.running = False
+            self.df_filtered = self.parser.df_parsed[(self.parser.df_parsed['BMS_DCChrgSt'] > 0)
+                                                     & (self.parser.df_parsed['BMS_DCChrgSt'] < 4) & (
+                                                             self.parser.df_parsed['BMS_BattCurrt'] > -100)].head(100)
+            # self.df_filtered = self.parser.df_parsed[(self.parser.df_parsed['BMS_DCChrgSt'] > 0)]
+            logging.warning(f'df_filtered:{self.df_filtered}')
+            self.create_signal_visualizer()
+            self.bt_start.enable()
+
+    async def update_progress(self):
+        self.progressbar.set_value(self.queue.get() if not self.queue.empty() else self.progressbar.value)
+
+    def create_signal_visualizer(self):
+        self.signal_columns = [col for col in self.parser.df_parsed.columns if col not in ['dt', 'ts']]
+        self.signal_visibility = {signal: False for signal in self.signal_columns}
+        for signal in self.show_signals:
+            self.signal_visibility[signal] = True
+        self.graph_container.clear()
+        self.graph_container.classes(remove='hidden')
+        with self.graph_container:
+            with ui.row().classes('w-full h-full gap-4'):
+                with ui.card().classes('w-full h-full p-4 border rounded-lg shadow-md'):
+                    self.chart_placeholder = ui.column().classes('w-full h-full')
+                    with self.chart_placeholder:
+                        fig = self.create_plotly_figure()
+                        ui.plotly(fig).classes('w-full h-full')
+                with ui.card().classes('w-full max-h-128 p-4 border rounded-lg shadow-md overflow-auto'):
+                    # 创建可折叠的思考部分
+                    with ui.column().classes("w-full mb-4") as thinking_container:
+                        # 思考部分标题 - 可点击展开/折叠
+                        with ui.row().classes("items-center gap-2 cursor-pointer") as thinking_header:
+                            thinking_icon = ui.icon("expand_more").classes("text-gray-500 text-sm transition-transform")
+                            thinking_title = ui.label("思考中...").classes("text-gray-500 text-sm font-medium")
+
+                        # 思考内容区域 - 初始展开状态
+                        with ui.column().classes("ml-4 mt-2") as thinking_content:
+                            with ui.row().classes(
+                                    "bg-gray-50 rounded-2xl rounded-tl-none px-4 py-3 max-w-full border border-gray-200"):
+                                thinking_text = ui.markdown("").classes("text-gray-700 text-sm")
+
+                    # 正式回复部分容器
+                    with ui.column().classes("w-full mt-4"):
+                        with ui.row().classes(
+                                "bg-white rounded-2xl rounded-tl-none px-4 py-3 max-w-full") as response_container:
+                            response_markdown = ui.markdown("").classes("text-gray-800")
+
+                    # 设置思考部分的展开/折叠功能
+                    thinking_expanded = True  # 初始为展开状态
+
+                    def toggle_thinking():
+                        nonlocal thinking_expanded
+                        thinking_expanded = not thinking_expanded
+                        if thinking_expanded:
+                            thinking_icon.classes(replace="text-gray-500 text-sm transition-transform")
+                            thinking_content.set_visibility(True)
+                        else:
+                            thinking_icon.classes(replace="text-gray-500 text-sm transition-transform rotate-[-90deg]")
+                            thinking_content.set_visibility(False)
+
+                    thinking_header.on("click", toggle_thinking)
+
+                    asyncio.create_task(
+                        self.analyze_with_api(thinking_text, thinking_title, thinking_icon, thinking_content,
+                                              thinking_expanded, response_markdown))
+
+    async def analyze_with_api(self, thinking_text, thinking_title, thinking_icon, thinking_content, thinking_expanded,
+                               response_markdown):
+        """调用API进行分析并流式显示结果，分离思考内容和正式回答"""
+        if self.df_filtered.empty:
+            response_markdown.content = "没有数据可供分析"
+            return
+
+        # 准备发送给API的消息，包含关键数据统计信息
+        message = promote(self.df_filtered.to_markdown(index=False))
+        # logging.warning(f"send message:{message}")
+
+        try:
+            thinking_text.content = "正在分析数据，请稍候..."
+            response_markdown.content = ""
+
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                        "POST",
+                        "http://10.143.18.198:8000/chat",  # API地址
+                        timeout=600,
+                        json={"message": message, "session_id": self.session_id, "reset_history": False}
+                ) as response:
+                    response.raise_for_status()  # 检查HTTP错误状态码
+
+                    # 从响应头获取会话ID（新会话时）
+                    new_session_id = response.headers.get("X-Session-ID")
+                    if new_session_id and not self.session_id:
+                        self.session_id = new_session_id
+
+                    buffer = ""
+                    thinking_content_text = ""
+                    response_content = ""
+                    thinking_complete = False
+
+                    # 逐块处理流式响应
+                    async for chunk in response.aiter_text():
+                        if chunk:
+                            buffer += chunk
+
+                            # 如果还没有完成思考部分，检查是否遇到了结束标记
+                            if not thinking_complete:
+                                if "</think>" in buffer:
+                                    # 分割思考部分和正式回复部分
+                                    parts = buffer.split("</think>", 1)
+                                    # 只添加新的思考内容，避免重复
+                                    new_thinking_content = parts[0][len(thinking_content_text):]
+                                    thinking_content_text += new_thinking_content
+
+                                    # 更新思考内容
+                                    thinking_text.content = thinking_content_text
+                                    thinking_title.text = "思考过程"  # 思考完成后更新标题
+
+                                    # 思考完成后自动折叠
+                                    thinking_expanded = False
+                                    thinking_icon.classes(
+                                        replace="text-gray-500 text-sm transition-transform rotate-[-90deg]")
+                                    thinking_content.set_visibility(False)
+
+                                    # 如果有内容在</think>之后，添加到响应内容
+                                    if len(parts) > 1 and parts[1]:
+                                        response_content += parts[1]
+                                        response_markdown.content = response_content
+
+                                    thinking_complete = True
+                                    buffer = ""  # 清空缓冲区
+                                else:
+                                    # 仍在思考部分 - 只添加新内容
+                                    new_thinking_content = chunk
+                                    thinking_content_text += new_thinking_content
+                                    thinking_text.content = thinking_content_text
+                            else:
+                                # 思考部分已完成，所有新内容都是正式回复
+                                response_content += chunk
+                                response_markdown.content = response_content
+
+                            await asyncio.sleep(0.01)  # 稍微延迟让UI更新
+        except httpx.RequestError as e:
+            logging.exception(f"API请求错误: {str(e)}")  # 会自动记录完整的堆栈跟踪
+            response_markdown.content = f"请求API失败: {str(e)}"
+        except Exception as e:
+            logging.exception(f"分析过程错误: {str(e)}")  # 会自动记录完整的堆栈跟踪
+            response_markdown.content = f"分析出错: {str(e)}"
+
+    def create_plotly_figure(self):
+        """创建Plotly图表"""
+        fig = make_subplots(
+            rows=len(self.show_signals), cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.02,
+            subplot_titles=self.show_signals
+        )
+
+        data = self.parser.df_parsed
+        hover_data = []
+        for _, row in data.iterrows():
+            hover_text = [f"时间: {row['ts']}"]
+            for signal in self.signal_columns:
+                hover_text.append(f"{signal}: {row[signal]:.2f}")
+            hover_data.append("<br>".join(hover_text))
+        # 为每个可见信号添加子图
+        for i, signal in enumerate(self.show_signals, 1):
+            color_idx = self.signal_columns.index(signal) % len(self.chart_colors)
+            fig.add_trace(
+                go.Scatter(
+                    x=data['ts'],
+                    y=data[signal],
+                    mode='lines',  # 确保同时显示线条和标记
+                    name=signal,
+                    hovertemplate=hover_data,
+                    line=dict(width=2, color=self.chart_colors[color_idx]),
+                    marker=dict(
+                        size=3,  # 小标记点
+                        opacity=0.6,  # 半透明
+                        color=self.chart_colors[color_idx]
+                    ),
+                    connectgaps=True,
+                ),
+                row=i, col=1
+            )
+
+            # 美化y轴
+            fig.update_yaxes(
+                showgrid=True,
+                gridcolor='rgba(200, 200, 200, 0.2)',
+                row=i, col=1
+            )
+
+        # 更新布局
+        fig.update_layout(
+            height=max(400, 150 * len(self.show_signals)),  # 增加每个子图的高度
+            margin=dict(l=60, r=40, t=80, b=60),
+            hovermode='x unified',
+            showlegend=False
+        )
+
+        # 更新x轴样式
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor='rgba(200, 200, 200, 0.2)',
+            row=len(self.show_signals), col=1
+        )
+
+        return fig
