@@ -46,9 +46,18 @@ class AnalysisRead(BaseModel):
     id: int
     name: str
     description: Optional[str]
+    file_path: str
+    file_size: Optional[int]
+    file_type: Optional[str]
     status: str
     progress: float
+    result_data: Optional[str]
+    error_message: Optional[str]
+    user_id: int
     created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
 
     class Config:
         from_attributes = True
@@ -80,6 +89,54 @@ class RagQueryResponse(BaseModel):
 class RagCollectionCreate(BaseModel):
     name: str
     description: Optional[str] = None
+
+
+class RagCollectionRead(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    collection_type: str
+    document_count: int
+    embedding_model: str
+    is_active: bool
+    created_by: Optional[int]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class KnowledgeDocumentRead(BaseModel):
+    id: int
+    collection_id: int
+    filename: str
+    file_path: str
+    file_size: Optional[int]
+    file_type: Optional[str]
+    chunk_count: int
+    upload_status: str
+    processing_error: Optional[str]
+    uploaded_by: Optional[int]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RagQueryRecord(BaseModel):
+    id: int
+    collection_id: int
+    query_text: str
+    result_count: int
+    response_text: Optional[str]
+    user_id: Optional[int]
+    query_time_ms: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 # ---------- 训练 ----------

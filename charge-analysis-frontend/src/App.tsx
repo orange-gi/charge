@@ -138,7 +138,7 @@ const Dashboard = () => {
         <div style={{ color: 'white' }}>
           <UserOutlined style={{ marginRight: '8px' }} />
           {user?.username || user?.email}
-          <Button type="link" onClick={logout} style={{ color: 'white', marginLeft: '16px' }}>
+          <Button type="link" onClick={() => logout()} style={{ color: 'white', marginLeft: '16px' }}>
             <LogoutOutlined /> 退出
           </Button>
         </div>
@@ -170,6 +170,7 @@ const Dashboard = () => {
 };
 
 const HomePage = () => {
+  const { user, token } = useAuthStore();
   const [stats, setStats] = React.useState({
     totalAnalyses: 0,
     completedAnalyses: 0,
@@ -182,19 +183,28 @@ const HomePage = () => {
 
   // Load real data on mount
   React.useEffect(() => {
-    loadDashboardData();
-  }, []);
+    if (token) {
+      loadDashboardData();
+    }
+  }, [token, user]);
 
   const loadDashboardData = async () => {
+    if (!token) {
+      return;
+    }
     try {
       const { statsService } = await import('./services/statsService');
       
       // Load stats
-      const statsData = await statsService.getSystemStats();
+      const statsData = await statsService.getSystemStats(token);
       setStats(statsData);
       
       // Load recent activities
-      const activities = await statsService.getRecentActivities(4);
+      const activities = await statsService.getRecentActivities(
+        token,
+        user?.username || user?.email || '当前用户',
+        4
+      );
       setRecentActivities(activities);
     } catch (error) {
       console.error('加载仪表板数据失败:', error);
@@ -367,21 +377,22 @@ const ChargingPage = () => {
   const [status, setStatus] = React.useState<string>('idle');
   const [results, setResults] = React.useState<any[]>([]);
   const [analysisHistory, setAnalysisHistory] = React.useState<any[]>([]);
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   // Load analysis history on mount
   React.useEffect(() => {
-    if (user) {
+    if (user && token) {
       loadAnalysisHistory();
     }
-  }, [user]);
+  }, [user, token]);
 
   const loadAnalysisHistory = async () => {
+    if (!token) return;
     try {
       const { chargingService } = await import('./services/chargingService');
-      const history = await chargingService.getUserAnalyses(user!.id, 10);
-      setAnalysisHistory(history);
+      const history = await chargingService.getUserAnalyses(token);
+      setAnalysisHistory(history.slice(0, 10));
     } catch (error) {
       console.error('加载历史记录失败:', error);
     }
@@ -394,32 +405,31 @@ const ChargingPage = () => {
   };
 
   const handleUpload = async () => {
-    if (!file || !user) return;
+    if (!file || !user || !token) return;
 
     setStatus('uploading');
     setResults([]);
     try {
       const { chargingService } = await import('./services/chargingService');
-      const token = useAuthStore.getState().token!;
       
       message.loading('上传中...', 0);
-      const result = await chargingService.uploadFile(file, user.id, token, file.name);
+      const analysis = await chargingService.uploadFile(file, token, file.name);
       message.destroy();
       message.success('文件上传成功');
       
-      setAnalysisId(result.analysisId);
+      setAnalysisId(analysis.id);
       setStatus('uploaded');
       
       // Start analysis
       message.loading('开始分析...', 0);
-      await chargingService.startAnalysis(result.analysisId, user.id, token);
+      await chargingService.startAnalysis(analysis.id, token);
       message.destroy();
       message.success('分析已开始');
       
       setStatus('analyzing');
       
       // Poll for results
-      pollAnalysisStatus(result.analysisId);
+      pollAnalysisStatus(analysis.id);
       
     } catch (error: any) {
       message.destroy();
@@ -429,11 +439,13 @@ const ChargingPage = () => {
   };
 
   const pollAnalysisStatus = async (id: number) => {
+    const authToken = useAuthStore.getState().token;
+    if (!authToken) return;
     const { chargingService } = await import('./services/chargingService');
     
     const interval = setInterval(async () => {
       try {
-        const analysis = await chargingService.getAnalysis(id);
+        const analysis = await chargingService.getAnalysis(id, authToken);
         
         if (analysis.status === 'completed') {
           clearInterval(interval);
@@ -441,7 +453,7 @@ const ChargingPage = () => {
           message.success('分析完成');
           
           // Load results and display them
-          const analysisResults = await chargingService.getAnalysisResults(id);
+          const analysisResults = await chargingService.getAnalysisResults(id, authToken);
           setResults(analysisResults);
           
           // Refresh history
@@ -461,9 +473,13 @@ const ChargingPage = () => {
   };
 
   const loadHistoryResults = async (id: number) => {
+    if (!token) {
+      message.error('请先登录');
+      return;
+    }
     try {
       const { chargingService } = await import('./services/chargingService');
-      const analysisResults = await chargingService.getAnalysisResults(id);
+      const analysisResults = await chargingService.getAnalysisResults(id, token);
       setResults(analysisResults);
       setAnalysisId(id);
       setStatus('completed');
@@ -660,55 +676,108 @@ const RAGPage = () => {
   const [documents, setDocuments] = React.useState<any[]>([]);
   const [uploadFile, setUploadFile] = React.useState<File | null>(null);
   const [queryHistory, setQueryHistory] = React.useState<any[]>([]);
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
-  const [collectionId] = React.useState(1); // Default collection ID
+  const [collections, setCollections] = React.useState<any[]>([]);
+  const [collectionId, setCollectionId] = React.useState<number | null>(null);
+  const [isLoadingCollections, setIsLoadingCollections] = React.useState(false);
 
-  // Load documents and query history on mount
   React.useEffect(() => {
-    loadDocuments();
-    loadQueryHistory();
-  }, []);
+    if (token) {
+      loadCollections();
+    }
+  }, [token]);
 
-  const loadDocuments = async () => {
+  React.useEffect(() => {
+    if (collectionId && token) {
+      loadDocuments(collectionId);
+      loadQueryHistory(collectionId);
+    }
+  }, [collectionId, token]);
+
+  const loadCollections = async () => {
+    if (!token) return;
+    try {
+      setIsLoadingCollections(true);
+      const { ragService } = await import('./services/ragService');
+      let data = await ragService.getCollections(token);
+      if (data.length === 0) {
+        const created = await ragService.createCollection('默认知识库', '系统自动创建', token);
+        data = [created];
+      }
+      setCollections(data);
+      setCollectionId((prev) => prev ?? data[0]?.id ?? null);
+    } catch (error) {
+      console.error('加载知识库失败:', error);
+    } finally {
+      setIsLoadingCollections(false);
+    }
+  };
+
+  const loadDocuments = async (targetId: number) => {
+    if (!token) return;
     try {
       const { ragService } = await import('./services/ragService');
-      const docs = await ragService.getDocuments(collectionId);
+      const docs = await ragService.getDocuments(targetId, token);
       setDocuments(docs);
     } catch (error) {
       console.error('加载文档失败:', error);
     }
   };
 
-  const loadQueryHistory = async () => {
+  const loadQueryHistory = async (targetId: number) => {
+    if (!token) return;
     try {
       const { ragService } = await import('./services/ragService');
-      const history = await ragService.getQueryHistory(collectionId, 10);
+      const history = await ragService.getQueryHistory(targetId, token, 10);
       setQueryHistory(history);
     } catch (error) {
       console.error('加载查询历史失败:', error);
     }
   };
 
+  const handleCreateCollection = async () => {
+    if (!token) {
+      message.warning('请先登录');
+      return;
+    }
+    try {
+      message.loading('创建知识库...', 0);
+      const { ragService } = await import('./services/ragService');
+      const name = `知识库-${collections.length + 1}`;
+      const collection = await ragService.createCollection(name, '自动创建', token);
+      message.destroy();
+      message.success('知识库创建成功');
+      setCollections((prev: any[]) => [collection, ...prev]);
+      setCollectionId(collection.id);
+    } catch (error: any) {
+      message.destroy();
+      message.error(error.message || '创建失败');
+    }
+  };
+
   const handleQuery = async () => {
-    if (!query.trim() || !user) {
+    if (!query.trim()) {
       message.warning('请输入查询内容');
+      return;
+    }
+    if (!token || !collectionId) {
+      message.warning('请选择知识库');
       return;
     }
 
     setIsQuerying(true);
     try {
       const { ragService } = await import('./services/ragService');
-      const token = useAuthStore.getState().token!;
       
       // Call real RAG query
-      const response = await ragService.query(collectionId, query, user.id, token);
+      const response = await ragService.query(collectionId, query, token);
       
       setAnswer(response.response);
       message.success('查询完成');
       
       // Reload query history
-      loadQueryHistory();
+      loadQueryHistory(collectionId);
       
     } catch (error: any) {
       message.error(error.message || '查询失败');
@@ -718,17 +787,20 @@ const RAGPage = () => {
   };
 
   const handleUploadDocument = async () => {
-    if (!uploadFile || !user) {
+    if (!uploadFile) {
       message.warning('请选择要上传的文件');
+      return;
+    }
+    if (!token || !collectionId) {
+      message.warning('请选择知识库');
       return;
     }
 
     try {
       message.loading('上传中...', 0);
       const { ragService } = await import('./services/ragService');
-      const token = useAuthStore.getState().token!;
       
-      await ragService.uploadDocument(collectionId, uploadFile, user.id, token);
+      await ragService.uploadDocument(collectionId, uploadFile, token);
       
       message.destroy();
       message.success('文档上传成功');
@@ -738,7 +810,7 @@ const RAGPage = () => {
       }
       
       // Reload documents
-      loadDocuments();
+      loadDocuments(collectionId);
     } catch (error: any) {
       message.destroy();
       message.error(error.message || '上传失败');
@@ -751,6 +823,29 @@ const RAGPage = () => {
       <p style={{ marginTop: '8px', color: '#666' }}>
         智能检索技术文档，快速获取相关知识和解决方案
       </p>
+      <div style={{ marginTop: '16px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <span style={{ fontWeight: 500 }}>当前知识库：</span>
+        <select
+          value={collectionId ?? ''}
+          onChange={(e) => setCollectionId(e.target.value ? Number(e.target.value) : null)}
+          style={{ padding: '6px 12px', borderRadius: '6px', border: '1px solid #d9d9d9' }}
+          disabled={isLoadingCollections || collections.length === 0}
+        >
+          {collections.length === 0 && (
+            <option value="" disabled>
+              暂无知识库
+            </option>
+          )}
+          {collections.map((collection: any) => (
+            <option key={collection.id} value={collection.id}>
+              {collection.name}
+            </option>
+          ))}
+        </select>
+        <Button size="small" onClick={handleCreateCollection} disabled={isLoadingCollections}>
+          新建知识库
+        </Button>
+      </div>
 
       {/* 查询区域 */}
       <div style={{ marginTop: '24px', padding: '24px', background: '#f6f8fa', borderRadius: '12px' }}>
@@ -924,24 +1019,25 @@ const TrainingPage = () => {
   const [datasetId, setDatasetId] = React.useState<number | null>(null);
   const [taskName, setTaskName] = React.useState('');
   const [taskStatus, setTaskStatus] = React.useState<string>('idle');
-  const { user } = useAuthStore();
+  const { user, token } = useAuthStore();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleDatasetUpload = async () => {
-    if (!datasetFile || !datasetName || !user) return;
+    if (!datasetFile || !datasetName || !user || !token) return;
 
     setUploadStatus('uploading');
     try {
       const { trainingService } = await import('./services/trainingService');
-      const token = useAuthStore.getState().token!;
       
       message.loading('上传数据集...', 0);
       const dataset = await trainingService.uploadDataset(
         datasetName,
         datasetFile,
-        user.id,
         token,
-        '训练数据集'
+        {
+          description: '训练数据集',
+          datasetType: 'standard'
+        }
       );
       message.destroy();
       message.success('数据集上传成功');
@@ -957,12 +1053,11 @@ const TrainingPage = () => {
   };
 
   const handleCreateTask = async () => {
-    if (!taskName || !datasetId || !user) return;
+    if (!taskName || !datasetId || !user || !token) return;
 
     setTaskStatus('creating');
     try {
       const { trainingService } = await import('./services/trainingService');
-      const token = useAuthStore.getState().token!;
       
       message.loading('创建训练任务...', 0);
       const task = await trainingService.createTrainingTask(
@@ -970,7 +1065,6 @@ const TrainingPage = () => {
         datasetId,
         'flow_control',
         { epochs: 10, batch_size: 32, learning_rate: 0.001 },
-        user.id,
         token,
         '流程控制模型训练'
       );
@@ -996,12 +1090,13 @@ const TrainingPage = () => {
   };
 
   const pollTrainingStatus = async (taskId: number) => {
+    const authToken = useAuthStore.getState().token;
+    if (!authToken) return;
     const { trainingService } = await import('./services/trainingService');
-    const token = useAuthStore.getState().token!;
     
     const interval = setInterval(async () => {
       try {
-        const task = await trainingService.getTrainingStatus(taskId, token);
+        const task = await trainingService.getTrainingStatus(taskId, authToken);
         
         if (task.status === 'completed') {
           clearInterval(interval);

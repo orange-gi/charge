@@ -8,10 +8,6 @@
 .
 ├── charge-analysis-backend/     # 后端服务（Python + LangGraph）
 ├── charge-analysis-frontend/    # 前端应用（React + TypeScript）
-├── supabase/                    # Supabase 配置和函数
-│   ├── functions/               # Edge Functions
-│   ├── migrations/              # 数据库迁移
-│   └── tables/                  # 数据库表定义
 ├── docs/                        # 项目文档
 └── test_data/                   # 测试数据
 
@@ -21,8 +17,8 @@
 
 ### 后端
 - Python 3.x
+- FastAPI + SQLAlchemy
 - LangGraph
-- Supabase Edge Functions
 
 ### 前端
 - React 18
@@ -32,7 +28,7 @@
 - Zustand
 
 ### 数据库
-- Supabase (PostgreSQL)
+- PostgreSQL
 
 ## 功能特性
 

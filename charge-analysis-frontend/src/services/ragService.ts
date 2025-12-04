@@ -1,174 +1,168 @@
-import { callEdgeFunction, querySupabase } from '../lib/supabase';
+import { apiRequest } from '../lib/api';
 
-interface KnowledgeCollection {
+export interface KnowledgeCollection {
   id: number;
   name: string;
-  description?: string;
-  collectionType: string;
+  description?: string | null;
   documentCount: number;
   embeddingModel: string;
+  collectionType: string;
   isActive: boolean;
-  createdBy?: number;
+  createdBy?: number | null;
   createdAt: string;
   updatedAt: string;
 }
 
-interface KnowledgeDocument {
+export interface KnowledgeDocument {
   id: number;
   collectionId: number;
   filename: string;
   filePath: string;
-  fileSize: number;
-  fileType?: string;
-  content?: string;
+  fileSize?: number | null;
+  fileType?: string | null;
+  content?: string | null;
   chunkCount: number;
-  metadata?: string;
+  metadata?: string | null;
   uploadStatus: string;
-  processingError?: string;
-  uploadedBy?: number;
+  processingError?: string | null;
+  uploadedBy?: number | null;
   createdAt: string;
   updatedAt: string;
 }
 
-interface RAGQuery {
+export interface RAGQueryRecord {
   id: number;
   collectionId: number;
   queryText: string;
   resultCount: number;
-  responseText?: string;
-  userId?: number;
-  queryTimeMs?: number;
+  responseText?: string | null;
+  userId?: number | null;
+  queryTimeMs?: number | null;
   createdAt: string;
 }
 
+interface BackendCollection {
+  id: number;
+  name: string;
+  description?: string | null;
+  document_count: number;
+  embedding_model: string;
+  collection_type: string;
+  is_active: boolean;
+  created_by?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BackendDocument {
+  id: number;
+  collection_id: number;
+  filename: string;
+  file_path: string;
+  file_size?: number | null;
+  file_type?: string | null;
+  content?: string | null;
+  chunk_count: number;
+  metadata?: string | null;
+  upload_status: string;
+  processing_error?: string | null;
+  uploaded_by?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BackendQueryRecord {
+  id: number;
+  collection_id: number;
+  query_text: string;
+  result_count: number;
+  response_text?: string | null;
+  user_id?: number | null;
+  query_time_ms?: number | null;
+  created_at: string;
+}
+
 export const ragService = {
-  // Create collection
-  async createCollection(
-    name: string,
-    description: string,
-    userId: number,
-    token: string
-  ): Promise<KnowledgeCollection> {
-    const response = await callEdgeFunction(
-      'ragQuery',
-      {
-        action: 'create_collection',
+  async createCollection(name: string, description: string | undefined, token: string): Promise<KnowledgeCollection> {
+    const data = await apiRequest<BackendCollection>('/api/rag/collections', {
+      method: 'POST',
+      token,
+      body: {
         name,
-        description,
-        userId
-      },
-      token
-    );
-
-    return transformCollectionData(response.data.collection);
-  },
-
-  // Get all collections
-  async getCollections(): Promise<KnowledgeCollection[]> {
-    const data = await querySupabase('knowledge_collections', 'GET', {
-      order: { column: 'created_at', ascending: false }
+        description
+      }
     });
-
-    return data.map(transformCollectionData);
-  },
-
-  // Get collection by ID
-  async getCollection(collectionId: number): Promise<KnowledgeCollection> {
-    const data = await querySupabase('knowledge_collections', 'GET', {
-      filter: { id: collectionId },
-      single: true
-    });
-
     return transformCollectionData(data);
   },
 
-  // Upload document
-  async uploadDocument(
-    collectionId: number,
-    file: File,
-    userId: number,
-    token: string
-  ): Promise<KnowledgeDocument> {
-    const base64Data = await fileToBase64(file);
-
-    const response = await callEdgeFunction(
-      'ragQuery',
-      {
-        action: 'upload',
-        collectionId,
-        documentFile: base64Data,
-        documentName: file.name,
-        userId
-      },
+  async getCollections(token: string): Promise<KnowledgeCollection[]> {
+    const data = await apiRequest<BackendCollection[]>('/api/rag/collections', {
       token
-    );
-
-    return transformDocumentData(response.data.document);
+    });
+    return data.map(transformCollectionData);
   },
 
-  // Get documents in collection
-  async getDocuments(collectionId: number): Promise<KnowledgeDocument[]> {
-    const data = await querySupabase('knowledge_documents', 'GET', {
-      filter: { collection_id: collectionId },
-      order: { column: 'created_at', ascending: false }
+  async getDocuments(collectionId: number, token: string): Promise<KnowledgeDocument[]> {
+    const data = await apiRequest<BackendDocument[]>(`/api/rag/collections/${collectionId}/documents`, {
+      token
     });
-
     return data.map(transformDocumentData);
   },
 
-  // Query RAG
-  async query(
-    collectionId: number,
-    query: string,
-    userId: number,
-    token: string
-  ): Promise<{ response: string; documents: any[]; queryTime: number }> {
-    const response = await callEdgeFunction(
-      'ragQuery',
-      {
-        action: 'query',
-        collectionId,
-        query,
-        userId
-      },
-      token
-    );
+  async uploadDocument(collectionId: number, file: File, token: string): Promise<KnowledgeDocument> {
+    const formData = new FormData();
+    formData.append('file', file);
 
-    return response.data;
-  },
-
-  // Get query history
-  async getQueryHistory(collectionId: number, limit: number = 50): Promise<RAGQuery[]> {
-    const data = await querySupabase('rag_queries', 'GET', {
-      filter: { collection_id: collectionId },
-      order: { column: 'created_at', ascending: false },
-      limit
+    const data = await apiRequest<BackendDocument>(`/api/rag/collections/${collectionId}/documents`, {
+      method: 'POST',
+      token,
+      body: formData
     });
 
+    return transformDocumentData(data);
+  },
+
+  async query(
+    collectionId: number,
+    queryText: string,
+    token: string
+  ): Promise<{ response: string; documents: any[]; queryTime: number }> {
+    const response = await apiRequest<{ response: string; documents: any[]; query_time: number }>(
+      '/api/rag/query',
+      {
+        method: 'POST',
+        token,
+        body: {
+          collection_id: collectionId,
+          query: queryText
+        }
+      }
+    );
+
+    return {
+      response: response.response,
+      documents: response.documents,
+      queryTime: response.query_time
+    };
+  },
+
+  async getQueryHistory(collectionId: number, token: string, limit: number = 50): Promise<RAGQueryRecord[]> {
+    const data = await apiRequest<BackendQueryRecord[]>(
+      `/api/rag/collections/${collectionId}/queries?limit=${limit}`,
+      { token }
+    );
     return data.map(transformQueryData);
   }
 };
 
-// Helper functions
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      resolve(reader.result as string);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-function transformCollectionData(data: any): KnowledgeCollection {
+function transformCollectionData(data: BackendCollection): KnowledgeCollection {
   return {
     id: data.id,
     name: data.name,
     description: data.description,
-    collectionType: data.collection_type,
     documentCount: data.document_count,
     embeddingModel: data.embedding_model,
+    collectionType: data.collection_type,
     isActive: data.is_active,
     createdBy: data.created_by,
     createdAt: data.created_at,
@@ -176,7 +170,7 @@ function transformCollectionData(data: any): KnowledgeCollection {
   };
 }
 
-function transformDocumentData(data: any): KnowledgeDocument {
+function transformDocumentData(data: BackendDocument): KnowledgeDocument {
   return {
     id: data.id,
     collectionId: data.collection_id,
@@ -195,7 +189,7 @@ function transformDocumentData(data: any): KnowledgeDocument {
   };
 }
 
-function transformQueryData(data: any): RAGQuery {
+function transformQueryData(data: BackendQueryRecord): RAGQueryRecord {
   return {
     id: data.id,
     collectionId: data.collection_id,

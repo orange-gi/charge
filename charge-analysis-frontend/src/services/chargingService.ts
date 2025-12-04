@@ -1,129 +1,126 @@
-import { callEdgeFunction, querySupabase } from '../lib/supabase';
+import { apiRequest } from '../lib/api';
 
-interface ChargingAnalysis {
+export interface ChargingAnalysis {
   id: number;
   name: string;
-  description?: string;
+  description?: string | null;
   filePath: string;
-  fileSize: number;
-  fileType: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  fileSize?: number | null;
+  fileType?: string | null;
+  status: string;
   progress: number;
-  resultData?: string;
-  errorMessage?: string;
+  resultData?: string | null;
+  errorMessage?: string | null;
   userId: number;
   createdAt: string;
   updatedAt: string;
-  startedAt?: string;
-  completedAt?: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
 }
 
-interface AnalysisResult {
+export interface AnalysisResult {
   id: number;
   analysisId: number;
   resultType: string;
   title: string;
   content: string;
-  confidenceScore?: number;
-  metadata?: string;
+  confidenceScore?: number | null;
+  metadata?: string | null;
   createdAt: string;
 }
 
+interface BackendAnalysis {
+  id: number;
+  name: string;
+  description?: string | null;
+  file_path: string;
+  file_size?: number | null;
+  file_type?: string | null;
+  status: string;
+  progress: number;
+  result_data?: string | null;
+  error_message?: string | null;
+  user_id: number;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+interface BackendAnalysisResult {
+  id: number;
+  analysis_id: number;
+  result_type: string;
+  title: string;
+  content: string;
+  confidence_score?: number | null;
+  metadata?: string | null;
+  created_at: string;
+}
+
 export const chargingService = {
-  // Upload file and create analysis
   async uploadFile(
     file: File,
-    userId: number,
     token: string,
     analysisName?: string,
     description?: string
-  ): Promise<{ analysisId: number; publicUrl: string }> {
-    // Convert file to base64
-    const base64Data = await fileToBase64(file);
+  ): Promise<ChargingAnalysis> {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (analysisName) {
+      formData.append('analysis_name', analysisName);
+    }
+    if (description) {
+      formData.append('description', description);
+    }
 
-    const response = await callEdgeFunction(
-      'fileUpload',
-      {
-        fileData: base64Data,
-        fileName: file.name,
-        fileSize: file.size,
-        userId,
-        analysisName: analysisName || file.name,
-        description
-      },
-      token
-    );
-
-    return {
-      analysisId: response.data.analysisId,
-      publicUrl: response.data.publicUrl
-    };
-  },
-
-  // Start analysis
-  async startAnalysis(analysisId: number, userId: number, token: string): Promise<void> {
-    await callEdgeFunction(
-      'chargingAnalysis',
-      {
-        analysisId,
-        userId
-      },
-      token
-    );
-  },
-
-  // Get analysis by ID
-  async getAnalysis(analysisId: number): Promise<ChargingAnalysis> {
-    const data = await querySupabase('charging_analyses', 'GET', {
-      filter: { id: analysisId },
-      single: true
+    const data = await apiRequest<BackendAnalysis>('/api/analyses/upload', {
+      method: 'POST',
+      token,
+      body: formData
     });
 
     return transformAnalysisData(data);
   },
 
-  // Get user's analyses
-  async getUserAnalyses(userId: number, limit: number = 50): Promise<ChargingAnalysis[]> {
-    const data = await querySupabase('charging_analyses', 'GET', {
-      filter: { user_id: userId },
-      order: { column: 'created_at', ascending: false },
-      limit
+  async startAnalysis(analysisId: number, token: string): Promise<void> {
+    await apiRequest(`/api/analyses/${analysisId}/run`, {
+      method: 'POST',
+      token
     });
-
-    return data.map(transformAnalysisData);
   },
 
-  // Get analysis results
-  async getAnalysisResults(analysisId: number): Promise<AnalysisResult[]> {
-    const data = await querySupabase('analysis_results', 'GET', {
-      filter: { analysis_id: analysisId },
-      order: { column: 'created_at', ascending: true }
+  async getAnalysis(analysisId: number, token: string): Promise<ChargingAnalysis> {
+    const data = await apiRequest<BackendAnalysis>(`/api/analyses/${analysisId}`, {
+      token
     });
-
-    return data.map(transformResultData);
+    return transformAnalysisData(data);
   },
 
-  // Delete analysis
-  async deleteAnalysis(analysisId: number): Promise<void> {
-    await querySupabase('charging_analyses', 'DELETE', {
-      filter: { id: analysisId }
+  async getUserAnalyses(token: string): Promise<ChargingAnalysis[]> {
+    const payload = await apiRequest<{ items: BackendAnalysis[] }>('/api/analyses', {
+      token
+    });
+    return (payload.items || []).map(transformAnalysisData);
+  },
+
+  async getAnalysisResults(analysisId: number, token: string): Promise<AnalysisResult[]> {
+    const data = await apiRequest<{ analysis: BackendAnalysis; results: BackendAnalysisResult[] }>(
+      `/api/analyses/${analysisId}/results`,
+      { token }
+    );
+    return (data.results || []).map(transformResultData);
+  },
+
+  async deleteAnalysis(analysisId: number, token: string): Promise<void> {
+    await apiRequest(`/api/analyses/${analysisId}`, {
+      method: 'DELETE',
+      token
     });
   }
 };
 
-// Helper functions
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      resolve(reader.result as string);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-function transformAnalysisData(data: any): ChargingAnalysis {
+function transformAnalysisData(data: BackendAnalysis): ChargingAnalysis {
   return {
     id: data.id,
     name: data.name,
@@ -143,7 +140,7 @@ function transformAnalysisData(data: any): ChargingAnalysis {
   };
 }
 
-function transformResultData(data: any): AnalysisResult {
+function transformResultData(data: BackendAnalysisResult): AnalysisResult {
   return {
     id: data.id,
     analysisId: data.analysis_id,

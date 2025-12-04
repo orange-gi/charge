@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
-import { callEdgeFunction } from '../lib/supabase';
+import { apiRequest } from '../lib/api';
 
 interface User {
   id: number;
@@ -21,7 +21,7 @@ interface AuthState {
   // Actions
   login: (credentials: LoginCredentials) => Promise<void>;
   register: (data: RegisterData) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
   initialize: () => Promise<void>;
   updateProfile: (data: Partial<User>) => Promise<void>;
 }
@@ -39,6 +39,33 @@ interface RegisterData {
   lastName?: string;
 }
 
+interface BackendUser {
+  id: number;
+  username: string;
+  email: string;
+  role: 'user' | 'admin';
+  first_name?: string;
+  last_name?: string;
+  last_login?: string;
+}
+
+interface AuthPayload {
+  user: BackendUser;
+  token: string;
+}
+
+function transformUser(payload: BackendUser): User {
+  return {
+    id: payload.id,
+    username: payload.username,
+    email: payload.email,
+    role: payload.role,
+    firstName: payload.first_name,
+    lastName: payload.last_name,
+    lastLogin: payload.last_login
+  };
+}
+
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
@@ -50,17 +77,17 @@ export const useAuthStore = create<AuthState>()(
       login: async (credentials: LoginCredentials) => {
         set({ isLoading: true });
         try {
-          const response = await callEdgeFunction('userAuth', {
-            action: 'login',
-            email: credentials.email,
-            password: credentials.password
+          const response = await apiRequest<AuthPayload>('/api/auth/login', {
+            method: 'POST',
+            body: {
+              email: credentials.email,
+              password: credentials.password
+            }
           });
-
-          const { user, token } = response.data;
           
           set({
-            user,
-            token,
+            user: transformUser(response.user),
+            token: response.token,
             isAuthenticated: true,
             isLoading: false
           });
@@ -73,21 +100,21 @@ export const useAuthStore = create<AuthState>()(
       register: async (data: RegisterData) => {
         set({ isLoading: true });
         try {
-          const response = await callEdgeFunction('userAuth', {
-            action: 'register',
-            email: data.email,
-            password: data.password,
-            username: data.username,
-            firstName: data.firstName,
-            lastName: data.lastName
+          const response = await apiRequest<AuthPayload>('/api/auth/register', {
+            method: 'POST',
+            body: {
+              email: data.email,
+              password: data.password,
+              username: data.username,
+              first_name: data.firstName,
+              last_name: data.lastName
+            }
           });
-
-          const { user, token } = response.data;
 
           // Auto login after registration
           set({
-            user,
-            token,
+            user: transformUser(response.user),
+            token: response.token,
             isAuthenticated: true,
             isLoading: false
           });
@@ -97,12 +124,19 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      logout: () => {
-        set({
-          user: null,
-          token: null,
-          isAuthenticated: false
-        });
+      logout: async () => {
+        const { token } = get();
+        if (token) {
+          try {
+            await apiRequest('/api/auth/logout', {
+              method: 'POST',
+              token
+            });
+          } catch {
+            // Ignore logout errors
+          }
+        }
+        set({ user: null, token: null, isAuthenticated: false });
       },
 
       initialize: async () => {
@@ -114,19 +148,18 @@ export const useAuthStore = create<AuthState>()(
 
         set({ isLoading: true });
         try {
-          const response = await callEdgeFunction('userAuth', {
-            action: 'verify'
-          }, token);
-
-          const { user } = response.data;
+          const user = await apiRequest<BackendUser>('/api/auth/me', {
+            method: 'GET',
+            token
+          });
           
           set({ 
-            user, 
+            user: transformUser(user), 
             isAuthenticated: true,
             isLoading: false
           });
         } catch (error) {
-          get().logout();
+          set({ user: null, token: null, isAuthenticated: false });
           set({ isLoading: false });
         }
       },
