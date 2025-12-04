@@ -12,8 +12,7 @@ from datetime import datetime
 from enum import Enum
 
 import pandas as pd
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint import Checkpointer
+from langgraph.graph import StateGraph, START, END
 
 # 设置日志
 logger = logging.getLogger(__name__)
@@ -766,6 +765,7 @@ class ChargingAnalysisWorkflow:
     def __init__(self):
         self.graph = StateGraph(ChargingAnalysisState)
         self._build_workflow()
+        self._app = self.graph.compile()
     
     def _build_workflow(self):
         """构建工作流图"""
@@ -788,7 +788,7 @@ class ChargingAnalysisWorkflow:
         self.graph.add_node("report_generation", report_generation.process)
         
         # 添加边
-        self.graph.add_edge("__root__", "file_validation")
+        self.graph.add_edge(START, "file_validation")
         self.graph.add_edge("file_validation", "message_parsing")
         self.graph.add_edge("message_parsing", "flow_control")
         self.graph.add_edge("flow_control", "rag_retrieval")
@@ -814,7 +814,7 @@ class ChargingAnalysisWorkflow:
             logger.info(f"开始执行充电分析工作流: {initial_state['analysis_id']}")
             
             # 执行工作流
-            final_state = await self.graph.ainvoke(initial_state)
+            final_state = await self._app.ainvoke(initial_state)
             
             logger.info(f"工作流执行完成: {final_state['analysis_id']}")
             
