@@ -1,219 +1,326 @@
-# 部署和配置文档
+# 部署与配置指南
 
-## 1. 环境配置指南
+本指南面向负责部署、运维与扩展 Charge Analysis System 的团队，覆盖从基础设施准备、环境搭建、数据库与存储规划，到监控、安全、备份与升级的完整流程。重点章节（第 6 章）对数据库与持久化存储提供了详细的落地实践，可直接用于生产环境实施。
 
-### 1.1 系统要求
+---
 
-#### 硬件要求
-- **CPU**: 4核心以上 (推荐8核心)
-- **内存**: 8GB以上 (推荐16GB)
-- **存储**: 100GB以上可用空间
-- **网络**: 稳定的互联网连接
+## 1. 文档适用范围
 
-#### 软件要求
-- **操作系统**: Ubuntu 20.04+ / CentOS 8+ / Windows 10+ / macOS 11+
-- **Docker**: 20.10.0+
-- **Docker Compose**: 2.0.0+
-- **Node.js**: 18.0+ (开发环境)
-- **Python**: 3.10+ (开发环境)
+- **目标读者**：DevOps、SRE、后端工程师、安全团队。
+- **适用阶段**：PoC、预生产、正式生产与多区域扩展。
+- **部署模式**：本地开发、Docker Compose 单节点、Kubernetes 多节点、混合云（数据库托管 + 自建应用）。
 
-### 1.2 依赖服务
+---
 
-#### 必需的外部服务
-1. **PostgreSQL 15**: 主数据库
-2. **Redis 7**: 缓存和会话存储
-3. **ChromaDB**: 向量数据库
-4. **OpenAI API** (可选): 用于LLM分析
+## 2. 基础环境准备
 
-#### 可选的服务
-1. **Nginx**: 反向代理
-2. **Prometheus**: 监控
-3. **Grafana**: 监控面板
+### 2.1 硬件资源建议
 
-## 2. 安装指南
+| 组件 | 最低规格 | 推荐规格 | 说明 |
+| --- | --- | --- | --- |
+| 应用节点（后端+前端） | 4 vCPU / 8 GB RAM / 100 GB SSD | 8 vCPU / 16 GB RAM / 200 GB SSD | 依据并发与模型体积可水平扩展 |
+| 数据库节点（PostgreSQL） | 4 vCPU / 16 GB RAM / 200 GB SSD | 8 vCPU / 32 GB RAM / 500 GB NVMe | 需要高 IOPS，详见 6.1.2 |
+| 缓存节点（Redis） | 2 vCPU / 4 GB RAM / 50 GB SSD | 4 vCPU / 8 GB RAM / 100 GB SSD | 若启用持久化需双盘冗余 |
+| 向量存储（ChromaDB） | 与应用节点共享 | 独立 4 vCPU / 8 GB RAM / 200 GB SSD | 取决于知识库规模 |
 
-### 2.1 后端安装
+### 2.2 软件依赖
 
-#### 2.1.1 使用 Docker 安装
+- **操作系统**：Ubuntu 20.04+/22.04, Debian 12, CentOS 8 Stream, 或等价云镜像。
+- **容器栈**：Docker 20.10+, Docker Compose 2.0+, 或 Kubernetes 1.26+。
+- **编译/运行环境**：Node.js 18+、pnpm 8+/npm 9+（前端）；Python 3.10+、Poetry/ pip（后端）。
+- **数据库客户端**：psql、pg_dump、redis-cli、wal-g（可选）。
 
-```bash
-# 克隆项目
-git clone https://github.com/your-repo/charge-analysis-system.git
-cd charge-analysis-system
+### 2.3 网络与账号
 
-# 进入后端目录
-cd charge-analysis-backend
+- 申请业务域名，并在 DNS 中创建 `api.<domain>`、`app.<domain>`、`ws.<domain>` 等记录。
+- 在云供应商（如 AWS、GCP、阿里云）中预先创建 VPC/VNet、子网、防火墙策略以及 Secrets/Parameter Store 命名空间。
+- 准备 Cloud KMS 或 Vault 账户用于托管敏感密钥（JWT、数据库密码、OpenAI Key 等）。
 
-# 创建环境配置文件
-cp .env.example .env
-# 编辑 .env 文件，配置数据库连接等参数
+---
 
-# 构建和启动服务
-docker-compose up -d --build
+## 3. 系统组件拓扑
+
+```
+[用户浏览器]
+      │
+  (Nginx/Ingress)
+      │
+ ┌────┴────┐
+ │         │
+前端 SPA   后端 API (FastAPI)
+             │││
+             ││└─ Redis 7（会话/任务队列）
+             │└── ChromaDB（向量检索）
+             └── PostgreSQL 15（事务库）
 ```
 
-#### 2.1.2 本地开发安装
+- **上游集成**：可选对接 OpenAI API、本地 LLM、对象存储（MinIO/S3）等。
+- **监控链路**：Prometheus + Grafana；日志统一写入 Elastic/ Loki 或对象存储。
 
+---
+
+## 4. 部署流程速览
+
+### 4.1 Docker Compose（推荐快速上线）
+
+1. 克隆仓库并进入根目录。
+2. 复制 `.env.example` 为 `.env` 并补齐凭证。
+3. 运行 `docker compose up -d --build`。
+4. 通过 `docker compose ps`、`docker compose logs -f backend` 验证状态。
+5. （可选）挂载 SSL 证书给 `nginx` 服务，开放 80/443 端口。
+
+### 4.2 本地开发流程
+
+#### 后端
 ```bash
-# 安装 Python 依赖
+cd charge-analysis-backend
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 创建数据库
-createdb charge_analysis
-
-# 运行数据库迁移
+cp .env.example .env  # 调整 DATABASE_URL 指向本地 PostgreSQL
 alembic upgrade head
-
-# 启动开发服务器
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 2.2 前端安装
-
-#### 2.2.1 使用 Docker 安装
-
+#### 前端
 ```bash
-# 进入前端目录
 cd charge-analysis-frontend
-
-# 构建 Docker 镜像
-docker build -t charge-analysis-frontend .
-
-# 启动前端服务
-docker run -d -p 3000:3000 charge-analysis-frontend
+pnpm install  # 或 npm install
+echo "VITE_API_URL=http://localhost:8000/api/v1" > .env.local
+pnpm dev --host 0.0.0.0 --port 3000
 ```
 
-#### 2.2.2 本地开发安装
+### 4.3 Kubernetes（生产多副本）
+
+- `k8s/namespace.yaml` 创建命名空间。
+- 针对 PostgreSQL/Redis 使用 StatefulSet + PersistentVolume（或托管服务 RDS/MemoryDB）。
+- 后端/前端使用 Deployment + HPA，Ingress 控制器（Nginx/Traefik）暴露外网。
+- 配置 ConfigMap/Secret 提供环境变量与密钥。
+
+> **提示**：若数据库采用云托管（Aurora、Cloud SQL、PolarDB），需在 VPC 内建立 PrivateLink 或 VPC Peering，避免公网暴露。
+
+---
+
+## 5. 配置与密钥管理
+
+### 5.1 环境变量分层
+
+| 层级 | 文件/位置 | 内容 | 管控建议 |
+| --- | --- | --- | --- |
+| 全局 | 根目录 `.env` | Docker Compose 统一变量 | 仅存放非敏感配置，敏感项引用 `secret.env` |
+| 后端 | `charge-analysis-backend/.env` | 数据库、Redis、JWT、LLM、对象存储 | 生产环境使用 Secret Manager 注入 |
+| 前端 | `charge-analysis-frontend/.env.production` | API URL、WebSocket、标题 | 构建前由 CI 写入 |
+| Kubernetes | ConfigMap/Secret | 分离配置与密钥 | 使用 `kubectl seal` 或 Vault Operator |
+
+### 5.2 核心变量示例
 
 ```bash
-# 安装依赖
-npm install
-
-# 启动开发服务器
-npm run dev
-```
-
-## 3. 配置说明
-
-### 3.1 环境变量配置
-
-#### 3.1.1 后端环境变量 (.env)
-
-```bash
-# 应用配置
+# 后端 (.env)
 APP_NAME=Charge Analysis Backend
-APP_VERSION=1.0.0
-DEBUG=false
 ENVIRONMENT=production
-
-# 服务器配置
 HOST=0.0.0.0
 PORT=8000
-
-# 数据库配置
-DATABASE_URL=postgresql://postgres:your_password@localhost:5432/charge_analysis
-
-# JWT 配置
-SECRET_KEY=your-super-secret-key-change-in-production
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-
-# Redis 配置
-REDIS_URL=redis://localhost:6379/0
-
-# 文件上传配置
-UPLOAD_PATH=/var/lib/charge-analysis/uploads
-MAX_FILE_SIZE=104857600  # 100MB
-
-# ChromaDB 配置
-CHROMA_PERSIST_DIRECTORY=/var/lib/charge-analysis/chromadb_data
-
-# 模型配置
+DATABASE_URL=postgresql://charge_user:${DB_PASSWORD}@postgres:5432/charge_analysis
+REDIS_URL=redis://redis:6379/0
+SECRET_KEY=${JWT_SECRET}
 BGE_MODEL_NAME=BAAI/bge-base-zh-v1.5
-SMALL_MODEL_PATH=/var/lib/charge-analysis/models/1.5b_flow_control_model
-LLM_MODEL_PATH=/var/lib/charge-analysis/models/llm_model
-
-# LLM 配置 (可选)
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_BASE_URL=https://api.openai.com/v1
-
-# CORS 配置
-ALLOWED_ORIGINS=["http://localhost:3000", "https://your-domain.com"]
-
-# 日志配置
-LOG_LEVEL=INFO
-LOG_FILE=/var/log/charge-analysis/app.log
+CHROMA_PERSIST_DIRECTORY=/var/lib/charge-analysis/chromadb_data
+OPENAI_API_KEY=${OPENAI_API_KEY}
+ALLOWED_ORIGINS=["https://app.example.com", "https://admin.example.com"]
 ```
-
-#### 3.1.2 前端环境变量
 
 ```bash
-# .env.local
-VITE_API_URL=http://localhost:8000/api/v1
-VITE_WS_URL=ws://localhost:8000
+# 前端 (.env.production)
 VITE_APP_TITLE=Charge Analysis System
+VITE_API_URL=https://api.example.com/api/v1
+VITE_WS_URL=wss://api.example.com/ws
 ```
 
-### 3.2 数据库配置
+---
 
-#### 3.2.1 PostgreSQL 配置
+## 6. 数据库与持久化存储
+
+### 6.1 PostgreSQL 15（核心事务库）
+
+#### 6.1.1 架构与拓扑
+
+- **单节点**：适合 PoC/小规模，使用本地持久盘或云块存储。
+- **主从同步**：1 主 + 至少 1 只读副本（Streaming Replication / Managed Read Replica），提供高可用与查询卸载。
+- **高可用组件**：
+  - 自建：Patroni + etcd，或 repmgr。
+  - 云托管：启用 Multi-AZ（Aurora、Cloud SQL、RDS、PolarDB）。
+- **网络**：只接受来自应用子网或指定堡垒机的连接；启用 TLS 加密 (`ssl = on`)；使用安全组限制 5432 端口。
+
+#### 6.1.2 资源与存储规划
+
+| 环境 | 数据量 | 推荐 vCPU/RAM | 存储 | 备注 |
+| --- | --- | --- | --- | --- |
+| PoC | < 10 GB | 2C / 8 GB | 100 GB SSD | 单 AZ 即可 |
+| 生产基础 | 10-200 GB | 4-8C / 16-32 GB | 500 GB NVMe / io2 | IOPS ≥ 6000 |
+| 大规模 | > 200 GB | 8-16C / 32-64 GB | 1 TB NVMe + WAL 独立盘 | 建议分离数据与 WAL，开启压缩 |
+
+- 建议开启自动扩容（LVM/云盘），定期评估 `pg_stat_database` 中的 `deadlocks`、`blks_read`。
+- WAL 日志持久化至独立磁盘或对象存储（使用 wal-g/wal-e）。
+
+#### 6.1.3 初始化与权限
 
 ```sql
--- 创建数据库
-CREATE DATABASE charge_analysis;
+-- 1. 创建数据库与角色
+CREATE DATABASE charge_analysis OWNER postgres;
+CREATE USER charge_user WITH PASSWORD 'REPLACE_ME';
+GRANT CONNECT ON DATABASE charge_analysis TO charge_user;
 
--- 创建用户
-CREATE USER charge_user WITH PASSWORD 'secure_password';
-GRANT ALL PRIVILEGES ON DATABASE charge_analysis TO charge_user;
+-- 2. 切换到业务库
+d \c charge_analysis
 
--- 配置连接限制
-ALTER SYSTEM SET max_connections = 100;
-ALTER SYSTEM SET shared_buffers = '256MB';
-ALTER SYSTEM SET effective_cache_size = '1GB';
-ALTER SYSTEM SET maintenance_work_mem = '64MB';
+-- 3. 授权 schema
+CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION charge_user;
+GRANT USAGE, CREATE ON SCHEMA public TO charge_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO charge_user;
+
+-- 4. 批准迁移用户
+CREATE ROLE alembic LOGIN PASSWORD 'REPLACE_ME' IN ROLE charge_user;
 ```
 
-#### 3.2.2 Redis 配置
+> 在生产环境中，推荐：
+> - 使用 `pgpass` 或 Secret Manager 注入密码。
+> - 将 `alembic` 迁移账号设置更严格权限（仅 DDL）。
 
+#### 6.1.4 参数调优
+
+在 `postgresql.conf` 或 Parameter Group 中设置：
+
+| 参数 | 建议值 | 说明 |
+| --- | --- | --- |
+| `max_connections` | 200（视连接池大小调整） | 若使用 PgBouncer，可降低到 100 |
+| `shared_buffers` | `RAM * 0.25`，如 8 GB | 提升缓存命中率 |
+| `effective_cache_size` | `RAM * 0.5`-`0.75` | 优化查询计划 |
+| `work_mem` | 32MB-64MB | 复杂查询需更高 |
+| `maintenance_work_mem` | 256MB | DDL/索引维护 |
+| `wal_level` | `replica`（HA）/`logical`（CDC） | 取决于复制需求 |
+| `archive_mode` | on（生产） | 配合 `archive_command` 推送 WAL |
+| `checkpoint_timeout` | 15min | 与 `max_wal_size` 配合，减少写放大 |
+
+#### 6.1.5 连接管理与中间件
+
+- **SQLAlchemy/AsyncPG**：在后端启用 `QueuePool`，示例：
+  ```python
+  engine = create_engine(
+      DATABASE_URL,
+      pool_size=20,
+      max_overflow=5,
+      pool_timeout=30,
+      pool_pre_ping=True,
+  )
+  ```
+- **PgBouncer**（推荐）
+  - 运行在应用同一子网，模式为 `transaction pooling`。
+  - 配置：`default_pool_size=50`、`max_client_conn=1000`、`ignore_startup_parameters=extra_float_digits`。
+  - 应用层 `DATABASE_URL` 改为 `postgresql://charge_user@pgbouncer:6432/charge_analysis`。
+
+#### 6.1.6 安全策略
+
+- **加密**：开启 TLS，证书可自签或使用内部 CA；客户端连接字符串添加 `?sslmode=require`。
+- **最小权限**：应用只授予 CRUD；分析/报表另行创建只读角色。
+- **审计**：开启 `pgaudit.log_catalog=on`、`log_statement='ddl'`，日志输出到集中系统。
+- **访问控制**：`pg_hba.conf` 中使用 CIDR 白名单与 SCRAM-SHA-256 认证。
+
+#### 6.1.7 迁移与版本管理
+
+- 使用 Alembic：
+  ```bash
+  alembic revision --autogenerate -m "add training metrics table"
+  alembic upgrade head
+  ```
+- 在 CI/CD 中：
+  1. 运行单元测试与静态检查。
+  2. 在待发布数据库执行 `alembic upgrade head`。
+  3. 若失败回滚：`alembic downgrade -1` 并恢复备份。
+
+#### 6.1.8 备份与恢复
+
+**逻辑备份（每日）**
 ```bash
-# redis.conf
-maxmemory 1gb
-maxmemory-policy allkeys-lru
-save 900 1
-save 300 10
-save 60 10000
+#!/bin/bash
+set -euo pipefail
+DB_NAME="charge_analysis"
+BACKUP_DIR="/backups/postgres"
+DATE=$(date +%Y%m%d_%H%M%S)
+pg_dump --format=custom --no-owner $DB_NAME \
+  | gzip > $BACKUP_DIR/${DB_NAME}_${DATE}.dump.gz
+find $BACKUP_DIR -name "${DB_NAME}_*.dump.gz" -mtime +30 -delete
 ```
 
-### 3.3 ChromaDB 配置
+**物理/WAL 备份（推荐）**
+- 使用 `wal-g backup-push /var/lib/postgresql/data`。
+- `wal-g wal-push` 配合 `archive_command` 将 WAL 上传到对象存储（S3/OSS）。
+- 恢复时执行 `wal-g backup-fetch` + `wal-g wal-fetch` 实现 Point-In-Time Recovery。
 
-```python
-# chromadb_config.py
-import chromadb
+**快速恢复流程**
+1. 停止应用写入（切换只读）。
+2. 在新实例上还原基础备份。
+3. 应用 WAL 到指定时间点。
+4. 更新 DNS/连接池指向新实例。
+5. 验证 `alembic current`、运行集成自检脚本。
 
-# 创建持久化客户端
-client = chromadb.PersistentClient(
-    path="/var/lib/charge-analysis/chromadb_data"
-)
+#### 6.1.9 日常维护
 
-# 创建集合
-collection = client.create_collection(
-    name="charging_knowledge",
-    metadata={"description": "充电相关知识库"}
-)
-```
+| 任务 | 频率 | 命令/说明 |
+| --- | --- | --- |
+| VACUUM (FULL) 大表 | 每周或大批量删除后 | `VACUUM (FULL, ANALYZE) table_name;` |
+| 重建索引 | 每季度 | `REINDEX TABLE ...;` |
+| 慢查询分析 | 每日 | `SELECT * FROM pg_stat_statements ORDER BY mean_time DESC LIMIT 10;` |
+| 容量巡检 | 每周 | `
+SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC LIMIT 20;
+` |
 
-## 4. 部署流程
+### 6.2 Redis 7（缓存 + 任务状态）
 
-### 4.1 Docker Compose 部署
+- 模式：
+  - 开发/小规模：单实例 + AOF。
+  - 生产：1 主 2 从 + Sentinel 或云托管（AWS Elasticache, Azure Cache for Redis）。
+- `redis.conf` 关键设置：
+  ```conf
+  bind 0.0.0.0
+  protected-mode yes
+  requirepass <REPLACE_ME>
+  maxmemory 1gb
+  maxmemory-policy allkeys-lru
+  appendonly yes
+  appendfsync everysec
+  save 900 1
+  save 300 10
+  save 60 10000
+  ```
+- 网络与安全：限制访问源，启用 TLS（若使用 6.0+ enterprise 或云托管）。
 
-#### 4.1.1 生产环境 docker-compose.yml
+### 6.3 ChromaDB（向量存储）
+
+- 推荐将 `CHROMA_PERSIST_DIRECTORY` 挂载到独立持久卷，定期快照（tar + rsync/S3）。
+- 大规模知识库可切换到托管向量服务（Pinecone、Milvus、Weaviate）。
+- 建议在部署时预热向量索引：
+  ```python
+  client = chromadb.PersistentClient(path="/var/lib/charge-analysis/chromadb_data")
+  collection = client.get_or_create_collection(
+      name="charging_knowledge",
+      metadata={"description": "充电业务知识库"}
+  )
+  ```
+
+---
+
+## 7. 应用部署细节
+
+### 7.1 Docker Compose 样例（生产）
 
 ```yaml
 version: '3.8'
-
 services:
-  # PostgreSQL 数据库
   postgres:
     image: postgres:15
+    env_file: .env
     environment:
       POSTGRES_DB: charge_analysis
       POSTGRES_USER: postgres
@@ -223,11 +330,12 @@ services:
       - ./backups:/backups
     ports:
       - "5432:5432"
-    restart: unless-stopped
-    networks:
-      - charge-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
 
-  # Redis 缓存
   redis:
     image: redis:7-alpine
     command: redis-server --appendonly yes
@@ -235,62 +343,46 @@ services:
       - redis_data:/data
     ports:
       - "6379:6379"
-    restart: unless-stopped
-    networks:
-      - charge-network
 
-  # 后端 API 服务
   backend:
     build:
       context: ./charge-analysis-backend
-      dockerfile: Dockerfile
-    environment:
-      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/charge_analysis
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY}
+    env_file:
+      - .env
+      - backend.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     volumes:
       - uploads_data:/app/uploads
       - chromadb_data:/app/chromadb_data
       - models_data:/app/models
     ports:
       - "8000:8000"
-    depends_on:
-      - postgres
-      - redis
-    restart: unless-stopped
-    networks:
-      - charge-network
 
-  # 前端 Web 服务
   frontend:
     build:
       context: ./charge-analysis-frontend
-      dockerfile: Dockerfile
     environment:
       - VITE_API_URL=${VITE_API_URL}
     ports:
       - "3000:80"
     depends_on:
       - backend
-    restart: unless-stopped
-    networks:
-      - charge-network
 
-  # Nginx 反向代理
   nginx:
     image: nginx:alpine
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
     ports:
       - "80:80"
       - "443:443"
     depends_on:
       - frontend
       - backend
-    restart: unless-stopped
-    networks:
-      - charge-network
 
 volumes:
   postgres_data:
@@ -298,561 +390,192 @@ volumes:
   uploads_data:
   chromadb_data:
   models_data:
-
-networks:
-  charge-network:
-    driver: bridge
 ```
 
-#### 4.1.2 启动服务
+### 7.2 Kubernetes 关键点
 
-```bash
-# 创建环境变量文件
-cat > .env << EOF
-POSTGRES_PASSWORD=your_secure_password
-SECRET_KEY=your_super_secret_jwt_key
-VITE_API_URL=https://your-domain.com/api/v1
-EOF
+- 使用 `StatefulSet + PersistentVolumeClaim` 部署 PostgreSQL/Redis，并结合 `initContainers` 执行权限修复。
+- 后端 Deployment 添加：
+  - `readinessProbe`：`httpGet /health`，初始延迟 10s。
+  - `livenessProbe`：`httpGet /health`，失败阈值 3。
+- 配置 `HorizontalPodAutoscaler`（CPU 60%、内存 70%）。
+- Ingress 中开启 `proxy-body-size 100m` 以支持大文件上传。
 
-# 启动所有服务
-docker-compose up -d
+---
 
-# 检查服务状态
-docker-compose ps
+## 8. 监控与日志
 
-# 查看日志
-docker-compose logs -f backend
-```
+### 8.1 日志
 
-### 4.2 Kubernetes 部署
-
-#### 4.2.1 部署文件结构
-
-```
-k8s/
-├── namespace.yaml
-├── postgres/
-│   ├── configmap.yaml
-│   ├── secret.yaml
-│   ├── deployment.yaml
-│   └── service.yaml
-├── redis/
-│   ├── deployment.yaml
-│   └── service.yaml
-├── backend/
-│   ├── configmap.yaml
-│   ├── secret.yaml
-│   ├── deployment.yaml
-│   ├── service.yaml
-│   └── ingress.yaml
-└── frontend/
-    ├── deployment.yaml
-    ├── service.yaml
-    └── ingress.yaml
-```
-
-#### 4.2.2 示例后端部署
-
-```yaml
-# k8s/backend/deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: charge-analysis-backend
-  namespace: charge-analysis
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: charge-analysis-backend
-  template:
-    metadata:
-      labels:
-        app: charge-analysis-backend
-    spec:
-      containers:
-      - name: backend
-        image: charge-analysis-backend:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: DATABASE_URL
-          valueFrom:
-            secretKeyRef:
-              name: database-secret
-              key: url
-        - name: REDIS_URL
-          valueFrom:
-            configMapKeyRef:
-              name: redis-config
-              key: url
-        volumeMounts:
-        - name: uploads
-          mountPath: /app/uploads
-        - name: chromadb
-          mountPath: /app/chromadb_data
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-      volumes:
-      - name: uploads
-        persistentVolumeClaim:
-          claimName: uploads-pvc
-      - name: chromadb
-        persistentVolumeClaim:
-          claimName: chromadb-pvc
-```
-
-## 5. 监控和日志
-
-### 5.1 日志配置
-
-#### 5.1.1 后端日志
+- 后端使用 Loguru，将 INFO/ERROR 分流到 `logs/app.log` 与 `logs/error.log`，并通过 Fluent Bit/Vector 派送到集中系统。
+- 前端在开发环境输出 `console`，生产仅通过 `/api/v1/logs` 上报，需启用速率限制与鉴权。
 
 ```python
-# logging_config.py
-import logging
-from loguru import logger
-import sys
-
-# 移除默认处理器
-logger.remove()
-
-# 添加控制台输出
-logger.add(
-    sys.stdout,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
-)
-
-# 添加文件输出
+# logging_config.py（节选）
 logger.add(
     "logs/app.log",
     rotation="1 day",
     retention="30 days",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="INFO"
-)
-
-# 添加错误文件输出
-logger.add(
-    "logs/error.log",
-    rotation="1 day",
-    retention="90 days",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="ERROR"
+    level="INFO",
+    enqueue=True,
 )
 ```
 
-#### 5.1.2 前端日志
+### 8.2 指标
 
-```javascript
-// logging.js
-class Logger {
-  static info(message, context = {}) {
-    if (import.meta.env.DEV) {
-      console.log(`[INFO] ${message}`, context);
-    }
-    // 发送到后端日志服务
-    this.sendLog('INFO', message, context);
-  }
+- Prometheus 抓取：
+  - 后端：`/metrics`（Starlette/Prometheus 中间件）。
+  - PostgreSQL：`postgres-exporter:9187`。
+  - Redis：`redis-exporter:9121`。
+- 关键指标：请求量、延迟、任务队列深度、活动分析数、向量检索耗时、数据库缓存命中率、复制延迟。
 
-  static error(message, error = null, context = {}) {
-    if (import.meta.env.DEV) {
-      console.error(`[ERROR] ${message}`, error, context);
-    }
-    this.sendLog('ERROR', message, { error, ...context });
-  }
+---
 
-  static async sendLog(level, message, context = {}) {
-    try {
-      await fetch('/api/v1/logs', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`
-        },
-        body: JSON.stringify({
-          level,
-          message,
-          context,
-          timestamp: new Date().toISOString()
-        })
-      });
-    } catch (error) {
-      // 静默失败
-    }
-  }
-}
+## 9. 安全与网络
 
-export default Logger;
-```
-
-### 5.2 性能监控
-
-#### 5.2.1 Prometheus 配置
-
-```yaml
-# prometheus.yml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'charge-analysis-backend'
-    static_configs:
-      - targets: ['backend:8000']
-    metrics_path: '/metrics'
-    scrape_interval: 30s
-
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['postgres-exporter:9187']
-
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis-exporter:9121']
-```
-
-#### 5.2.2 关键指标
-
-```python
-# metrics.py
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
-import time
-
-# 请求计数器
-REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
-REQUEST_DURATION = Histogram('http_request_duration_seconds', 'HTTP request duration')
-
-# 业务指标
-ACTIVE_ANALYSES = Gauge('active_analyses_total', 'Number of active analyses')
-ANALYSIS_COMPLETION_TIME = Histogram('analysis_completion_seconds', 'Time to complete analysis')
-VECTOR_SEARCH_TIME = Histogram('vector_search_seconds', 'Time for vector searches')
-
-# 启动指标服务器
-start_http_server(8001)
-```
-
-## 6. 安全配置
-
-### 6.1 HTTPS 配置
-
-#### 6.1.1 Nginx SSL 配置
+### 9.1 HTTPS / 反向代理
 
 ```nginx
-# nginx/ssl.conf
 server {
     listen 443 ssl http2;
-    server_name your-domain.com;
+    server_name api.example.com;
 
     ssl_certificate /etc/nginx/ssl/cert.pem;
     ssl_certificate_key /etc/nginx/ssl/key.pem;
-    
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    
-    # 安全头
     add_header Strict-Transport-Security "max-age=63072000" always;
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-    
+
     location / {
         proxy_pass http://frontend:80;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-    
+
     location /api/ {
         proxy_pass http://backend:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
-    
+
     location /ws/ {
         proxy_pass http://backend:8000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
     }
 }
-
-# HTTP 重定向到 HTTPS
-server {
-    listen 80;
-    server_name your-domain.com;
-    return 301 https://$server_name$request_uri;
-}
 ```
 
-### 6.2 防火墙配置
+### 9.2 防火墙
 
-```bash
-# Ubuntu UFW 配置
-sudo ufw enable
-sudo ufw allow ssh
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw allow from 10.0.0.0/8 to any port 5432
-sudo ufw allow from 10.0.0.0/8 to any port 6379
+- Ubuntu（UFW）
+  ```bash
+  sudo ufw allow OpenSSH
+  sudo ufw allow 80,443/tcp
+  sudo ufw allow from 10.0.0.0/8 to any port 5432 proto tcp
+  sudo ufw allow from 10.0.0.0/8 to any port 6379 proto tcp
+  sudo ufw enable
+  ```
+- Kubernetes：使用 NetworkPolicy，限制后端 Pod 仅能访问 PostgreSQL/Redis/ChromaDB。
 
-# CentOS firewalld 配置
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --permanent --add-service=https
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.0.0/8" port protocol="tcp" port="5432" accept'
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.0.0/8" port protocol="tcp" port="6379" accept'
-sudo firewall-cmd --reload
-```
+---
 
-## 7. 备份和恢复
+## 10. 备份与恢复
 
-### 7.1 数据库备份
+### 10.1 PostgreSQL
+- 逻辑备份脚本参见 6.1.8。
+- 配置 Cron：
+  ```cron
+  0 2 * * * /opt/scripts/backup_database.sh
+  ```
+
+### 10.2 文件与向量库
 
 ```bash
 #!/bin/bash
-# backup_database.sh
-
-DB_NAME="charge_analysis"
-DB_USER="postgres"
-BACKUP_DIR="/backups"
+BACKUP_DIR="/backups/files"
 DATE=$(date +%Y%m%d_%H%M%S)
-
-# 创建备份
-pg_dump -U $DB_USER -h localhost $DB_NAME > $BACKUP_DIR/backup_$DATE.sql
-
-# 压缩备份
-gzip $BACKUP_DIR/backup_$DATE.sql
-
-# 删除30天前的备份
-find $BACKUP_DIR -name "backup_*.sql.gz" -mtime +30 -delete
-
-echo "数据库备份完成: backup_$DATE.sql.gz"
+TEMP_DIR="/tmp/ca_files_$DATE"
+mkdir -p "$TEMP_DIR"
+cp -r /var/lib/charge-analysis/uploads "$TEMP_DIR"/uploads
+cp -r /var/lib/charge-analysis/chromadb_data "$TEMP_DIR"/chromadb
+tar -czf $BACKUP_DIR/files_$DATE.tar.gz -C "$TEMP_DIR" .
+rm -rf "$TEMP_DIR"
 ```
 
-### 7.2 文件备份
+### 10.3 自动化
 
+```cron
+0 3 * * * /opt/scripts/backup_files.sh
+0 4 * * 0 find /backups -name "*.tar.gz" -mtime +90 -delete
+```
+
+---
+
+## 11. 故障排除
+
+| 问题 | 诊断步骤 | 解决方案 |
+| --- | --- | --- |
+| 数据库连接失败 | `psql -h <host> -U <user> -d charge_analysis -c 'SELECT 1'` | 检查安全组、防火墙、`pg_hba.conf`、DNS 是否指向正确实例 |
+| 迁移卡住 | 查看 Alembic 日志、`alembic current` | 回滚到上一个版本，修复脚本后重跑 |
+| Redis 无法写入 | `redis-cli info persistence` | 检查磁盘空间、AOF 状态，必要时重启 + RDB 恢复 |
+| 内存压力 | `free -h`、`top -o %MEM` | 增加 swap、调低并发、扩容实例 |
+| Docker 容器频繁重启 | `docker compose logs <service>` | 校验环境变量、依赖服务 readiness、卷权限 |
+
+日志分析：
 ```bash
-#!/bin/bash
-# backup_files.sh
-
-BACKUP_DIR="/backups"
-DATE=$(date +%Y%m%d_%H%M%S)
-TEMP_DIR="/tmp/backup_$DATE"
-
-# 创建临时目录
-mkdir -p $TEMP_DIR
-
-# 备份上传文件
-cp -r /var/lib/charge-analysis/uploads $TEMP_DIR/
-
-# 备份 ChromaDB 数据
-cp -r /var/lib/charge-analysis/chromadb_data $TEMP_DIR/
-
-# 压缩备份
-tar -czf $BACKUP_DIR/files_backup_$DATE.tar.gz -C /tmp backup_$DATE
-
-# 清理临时目录
-rm -rf $TEMP_DIR
-
-echo "文件备份完成: files_backup_$DATE.tar.gz"
+tail -n 200 logs/app.log
+journalctl -u docker --since "10 min ago"
+docker compose logs -f backend
 ```
 
-### 7.3 自动化备份
-
-```bash
-# 添加到 crontab
-# 每天凌晨2点备份数据库
-0 2 * * * /path/to/backup_database.sh
-
-# 每天凌晨3点备份文件
-0 3 * * * /path/to/backup_files.sh
-
-# 每周清理旧备份
-0 4 * * 0 find /backups -name "backup_*.sql.gz" -mtime +90 -delete
-```
-
-## 8. 故障排除
-
-### 8.1 常见问题
-
-#### 8.1.1 数据库连接问题
-
-```bash
-# 检查数据库状态
-sudo systemctl status postgresql
-
-# 检查连接
-psql -h localhost -U postgres -d charge_analysis -c "SELECT version();"
-
-# 检查配置
-sudo -u postgres psql -c "SHOW max_connections;"
-```
-
-#### 8.1.2 Redis 连接问题
-
-```bash
-# 检查 Redis 状态
-sudo systemctl status redis
-
-# 测试连接
-redis-cli ping
-
-# 检查配置
-redis-cli config get "*"
-```
-
-#### 8.1.3 内存不足
-
-```bash
-# 检查内存使用
-free -h
-df -h
-
-# 检查进程
-top -o %MEM
-
-# 调整交换空间
-sudo fallocate -l 2G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-```
-
-### 8.2 日志分析
-
-```bash
-# 查看应用日志
-tail -f logs/app.log
-
-# 查看错误日志
-tail -f logs/error.log
-
-# 分析日志
-grep "ERROR" logs/app.log | head -20
-
-# 查看 Docker 容器日志
-docker-compose logs -f backend
-```
-
-### 8.3 性能调优
-
-#### 8.3.1 数据库优化
-
+性能调优：
 ```sql
--- 查看慢查询
-SELECT query, mean_time, calls 
-FROM pg_stat_statements 
-ORDER BY mean_time DESC 
-LIMIT 10;
-
--- 分析表大小
-SELECT 
-    schemaname,
-    tablename,
-    attname,
-    n_distinct,
-    correlation
-FROM pg_stats
-WHERE schemaname = 'public'
-ORDER BY n_distinct DESC;
+SELECT query, mean_time, calls
+FROM pg_stat_statements
+ORDER BY mean_time DESC LIMIT 10;
 ```
 
-#### 8.3.2 应用优化
+---
 
-```python
-# 启用连接池
-from sqlalchemy.pool import QueuePool
-
-engine = create_engine(
-    database_url,
-    poolclass=QueuePool,
-    pool_size=20,
-    max_overflow=0,
-    pool_pre_ping=True
-)
-
-# 启用缓存
-from functools import lru_cache
-import redis
-
-redis_client = redis.Redis(host='localhost', port=6379, db=0)
-
-@lru_cache(maxsize=100)
-def expensive_function(param):
-    # 昂贵的计算
-    return result
-```
-
-## 9. 升级指南
-
-### 9.1 版本升级流程
+## 12. 升级流程
 
 ```bash
-# 1. 备份数据
-./backup_database.sh
-./backup_files.sh
+# 1) 备份
+./backup_database.sh && ./backup_files.sh
 
-# 2. 停止服务
-docker-compose down
+# 2) 停止服务
+docker compose down  # 或 kubectl rollout pause
 
-# 3. 更新代码
+# 3) 获取新版本
 git pull origin main
 
-# 4. 更新依赖
-cd charge-analysis-backend
-pip install -r requirements.txt --upgrade
+# 4) 更新依赖
+(cd charge-analysis-backend && pip install -r requirements.txt)
+(cd charge-analysis-frontend && pnpm install)
 
-cd ../charge-analysis-frontend
-npm install
+# 5) 运行迁移
+cd charge-analysis-backend && alembic upgrade head
 
-# 5. 运行数据库迁移
-alembic upgrade head
+# 6) 重建并启动
+cd .. && docker compose up -d --build
 
-# 6. 重新构建和启动
-docker-compose up -d --build
-
-# 7. 验证升级
-curl -f http://localhost:8000/health
-curl -f http://localhost:3000
+# 7) 验证
+curl -f https://api.example.com/health
+curl -f https://app.example.com
 ```
 
-### 9.2 数据库迁移
+在 Kubernetes 中，使用分阶段滚动发布：`kubectl rollout restart deployment/charge-analysis-backend`，观察 `kubectl get pods` 与 `kubectl logs` 确认无错误。
 
-```bash
-# 创建迁移脚本
-alembic revision --autogenerate -m "Add new feature"
+---
 
-# 编辑迁移文件
-vim versions/abc123_add_feature.py
+## 13. 支持与资源
 
-# 应用迁移
-alembic upgrade head
+- **技术支持**：support@charge-analysis.com
+- **官方文档**：https://docs.charge-analysis.com
+- **GitHub**：https://github.com/your-org/charge-analysis-system
+- **社区**：论坛、Slack、Wiki（参考 README 中链接）
 
-# 回滚迁移（如需要）
-alembic downgrade -1
-```
+---
 
-## 10. 联系支持
-
-### 10.1 技术支持
-- **邮箱**: support@charge-analysis.com
-- **文档**: https://docs.charge-analysis.com
-- **GitHub**: https://github.com/your-org/charge-analysis-system
-
-### 10.2 社区资源
-- **论坛**: https://forum.charge-analysis.com
-- **Slack**: https://charge-analysis.slack.com
-- **Wiki**: https://wiki.charge-analysis.com
-
-这份部署和配置文档提供了完整的环境配置、部署流程、监控配置和安全设置指南，确保系统能够稳定、安全地运行在生产环境中。
+若在部署过程中遇到文档未覆盖的场景，可将问题和上下文记录在 GitHub Issues 或内部知识库，以便后续版本补充。祝部署顺利！
