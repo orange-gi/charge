@@ -154,7 +154,7 @@ def list_results(analysis_id: int, user: User = Depends(get_current_user), db: S
                 "result_type": r.result_type,
                 "title": r.title,
                 "content": r.content,
-                "metadata": r.metadata,
+                "meta_info": r.meta_info,
                 "confidence_score": r.confidence_score,
                 "created_at": r.created_at.isoformat(),
             }

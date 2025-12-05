@@ -25,7 +25,7 @@ export interface AnalysisResult {
   title: string;
   content: string;
   confidenceScore?: number | null;
-  metadata?: string | null;
+  metaInfo?: string | null;
   createdAt: string;
 }
 
@@ -54,7 +54,7 @@ interface BackendAnalysisResult {
   title: string;
   content: string;
   confidence_score?: number | null;
-  metadata?: string | null;
+  meta_info?: string | null;
   created_at: string;
 }
 
@@ -148,7 +148,7 @@ function transformResultData(data: BackendAnalysisResult): AnalysisResult {
     title: data.title,
     content: data.content,
     confidenceScore: data.confidence_score,
-    metadata: data.metadata,
+    metaInfo: data.meta_info,
     createdAt: data.created_at
   };
 }

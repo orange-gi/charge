@@ -106,7 +106,7 @@ class AnalysisService:
                     title="充电分析总结",
                     content=llm_analysis.get("summary") or summary_payload.get("final_report", {}).get("summary", ""),
                     confidence_score=summary_payload.get("flow_analysis", {}).get("confidence", 0.0),
-                    metadata=json.dumps({"category": "overview", "risk": llm_analysis.get("risk_assessment")}, ensure_ascii=False),
+                    meta_info=json.dumps({"category": "overview", "risk": llm_analysis.get("risk_assessment")}, ensure_ascii=False),
                 )
             )
 
@@ -118,7 +118,7 @@ class AnalysisService:
                         title=f"关键发现{idx}",
                         content=finding,
                         confidence_score=0.85,
-                        metadata=json.dumps({"category": "finding"}, ensure_ascii=False),
+                        meta_info=json.dumps({"category": "finding"}, ensure_ascii=False),
                     )
                 )
 
@@ -130,7 +130,7 @@ class AnalysisService:
                         title=f"建议措施{idx}",
                         content=rec,
                         confidence_score=0.8,
-                        metadata=json.dumps({"priority": "medium"}, ensure_ascii=False),
+                        meta_info=json.dumps({"priority": "medium"}, ensure_ascii=False),
                     )
                 )
 
@@ -143,7 +143,7 @@ class AnalysisService:
                         title="技术数据详情",
                         content=json.dumps(data_stats, ensure_ascii=False),
                         confidence_score=0.9,
-                        metadata=json.dumps({"category": "data"}, ensure_ascii=False),
+                        meta_info=json.dumps({"category": "data"}, ensure_ascii=False),
                     )
                 )
 
