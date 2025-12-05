@@ -141,7 +141,7 @@ class AnalysisResult(Base):
     title = Column(String(200), nullable=False)
     content = Column(Text)
     confidence_score = Column(Float)
-    metadata = Column(Text)  # JSON 数据
+    meta_info = Column(Text)  # JSON 数据
     created_at = Column(DateTime, default=func.now(), nullable=False)
     
     # 关系
@@ -182,7 +182,7 @@ class KnowledgeDocument(Base):
     file_type = Column(String(50))
     content = Column(Text)
     chunk_count = Column(Integer, default=0)
-    metadata = Column(Text)  # JSON 数据
+    meta_info = Column(Text)  # JSON 数据
     upload_status = Column(Enum(UploadStatus), default=UploadStatus.UPLOADING, nullable=False)
     processing_error = Column(Text)
     uploaded_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
@@ -221,7 +221,7 @@ class TrainingDataset(Base):
     dataset_type = Column(String(50), default="standard")
     file_path = Column(String(500))
     sample_count = Column(Integer, default=0)
-    metadata = Column(Text)  # JSON 数据
+    meta_info = Column(Text)  # JSON 数据
     is_public = Column(Boolean, default=False, nullable=False)
     created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
     created_at = Column(DateTime, default=func.now(), nullable=False)
@@ -323,7 +323,7 @@ class SystemLog(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
     request_id = Column(String(100))
     session_id = Column(String(100))
-    metadata = Column(Text)  # JSON 数据
+    meta_info = Column(Text)  # JSON 数据
     ip_address = Column(String(45))  # IPv6 支持
     user_agent = Column(Text)
     timestamp = Column(DateTime, default=func.now(), nullable=False)

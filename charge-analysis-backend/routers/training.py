@@ -53,7 +53,7 @@ async def upload_dataset(
         dataset_type=dataset_type,
         file_path=str(file_path),
         sample_count=sample_count,
-        metadata=json.dumps({"filename": file.filename, "uploaded_at": datetime.utcnow().isoformat()}),
+        meta_info=json.dumps({"filename": file.filename, "uploaded_at": datetime.utcnow().isoformat()}),
         is_public=False,
         created_by=user.id,
     )

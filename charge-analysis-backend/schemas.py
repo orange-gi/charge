@@ -115,6 +115,7 @@ class KnowledgeDocumentRead(BaseModel):
     file_size: Optional[int]
     file_type: Optional[str]
     chunk_count: int
+    meta_info: Optional[str] = None
     upload_status: str
     processing_error: Optional[str]
     uploaded_by: Optional[int]

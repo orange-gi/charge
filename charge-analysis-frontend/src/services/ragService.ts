@@ -22,7 +22,7 @@ export interface KnowledgeDocument {
   fileType?: string | null;
   content?: string | null;
   chunkCount: number;
-  metadata?: string | null;
+  metaInfo?: string | null;
   uploadStatus: string;
   processingError?: string | null;
   uploadedBy?: number | null;
@@ -63,7 +63,7 @@ interface BackendDocument {
   file_type?: string | null;
   content?: string | null;
   chunk_count: number;
-  metadata?: string | null;
+  meta_info?: string | null;
   upload_status: string;
   processing_error?: string | null;
   uploaded_by?: number | null;
@@ -180,7 +180,7 @@ function transformDocumentData(data: BackendDocument): KnowledgeDocument {
     fileType: data.file_type,
     content: data.content,
     chunkCount: data.chunk_count,
-    metadata: data.metadata,
+    metaInfo: data.meta_info,
     uploadStatus: data.upload_status,
     processingError: data.processing_error,
     uploadedBy: data.uploaded_by,
