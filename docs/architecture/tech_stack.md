@@ -351,51 +351,6 @@ TRAINING_WORKERS=4
 MAX_TRAINING_TIME=3600
 ```
 
-### 5.2 Docker 配置
-```dockerfile
-# Dockerfile for backend
-FROM python:3.10-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### 5.3 Docker Compose 配置
-```yaml
-version: '3.8'
-services:
-  frontend:
-    build: ./frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - REACT_APP_API_URL=http://localhost:8000
-  
-  backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://postgres:password@db:5432/charge_analysis
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - db
-      - redis
-  
-  db:
-    image: postgres:15
-    environment:
-      - POSTGRES_DB=charge_analysis
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-  
-  redis:
-    image: redis:7-alpine
-```
 
 ## 6. 开发工具链
 

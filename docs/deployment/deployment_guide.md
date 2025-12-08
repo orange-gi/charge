@@ -1,6 +1,6 @@
 # Windows 本地部署指南（Git Bash）
 
-本指南专为在 Windows 10/11 上使用 Git Bash 的开发者编写，目标是在本地机器上运行 Charge Analysis System（后端 FastAPI + 前端 React）。不涉及 Docker Compose、Kubernetes 或云端部署，只聚焦“我想在 Windows 上把项目跑起来”这一场景。
+本指南专为在 Windows 10/11 上使用 Git Bash 的开发者编写，目标是在本地机器上运行 Charge Analysis System（后端 FastAPI + 前端 React）。不涉及 Kubernetes 或云端部署，只聚焦"我想在 Windows 上把项目跑起来"这一场景。
 
 ---
 
@@ -21,9 +21,8 @@
 | Python | 3.10-3.11 | 勾选 "Add python.exe to PATH"，建议使用官方 installer 或 Microsoft Store |
 | Node.js | 18 LTS | 会自动附带 npm；若已安装 nvm-windows，可通过 `nvm install 18` 管理 |
 | pnpm | 8.x | `npm install -g pnpm`，Git Bash 中可直接使用 |
-| PostgreSQL | 15.x | 推荐使用 EnterpriseDB 安装包；若倾向容器，可安装 Docker Desktop 后使用 `docker run`（见 §4.1） |
-| Redis | 7.x | 可使用 Memurai、grokzen 的 Windows 端口，或借助 Docker 容器 |
-| 可选：Docker Desktop | 最新稳定版 | 若想用容器承载 PostgreSQL/Redis，可安装但非必需 |
+| PostgreSQL | 15.x | 推荐使用 EnterpriseDB 安装包 |
+| Redis | 7.x | 可使用 Memurai、grokzen 的 Windows 端口 |
 
 > **版本检查**：在 Git Bash 中执行以下命令，确认环境正常：
 >
@@ -64,26 +63,9 @@ cd charge-analysis-system
    psql -U postgres -h 127.0.0.1 -d charge_analysis -c "GRANT ALL PRIVILEGES ON DATABASE charge_analysis TO charge_user;"
    ```
 
-#### 方案 B：使用 Docker 承载 PostgreSQL
-```bash
-docker run -d --name ca-postgres -p 5432:5432 \
-  -e POSTGRES_DB=charge_analysis \
-  -e POSTGRES_USER=charge_user \
-  -e POSTGRES_PASSWORD=REPLACE_ME \
-  -v /c/charge-data/postgres:/var/lib/postgresql/data \
-  postgres:15
-docker logs -f ca-postgres  # 观察初始化情况
-```
-
-> 使用 Docker 时，请确保 Docker Desktop 正在运行，并在 *Settings → Resources* 中为 WSL 分配足够内存（8 GB+）。
-
 ### 4.2 Redis 准备
 
 - **原生方案**：安装 Memurai Community 版或 <https://github.com/tporadowski/redis/releases> 中的 Windows 构建，启动后监听 `localhost:6379`。
-- **Docker 方案**：
-  ```bash
-  docker run -d --name ca-redis -p 6379:6379 redis:7-alpine --appendonly yes
-  ```
 
 ### 4.3 Chroma/上传目录
 
@@ -194,7 +176,7 @@ pnpm dev --host 127.0.0.1 --port 3000
 | `OSError: [WinError 126]` | 缺少 VC++ 运行库 | 安装 "Microsoft Visual C++ Redistributable"，重启 Git Bash |
 | `psycopg` 编译失败 | 缺少 `pg_config` | 确认 PostgreSQL `bin` 目录已加入 PATH，或先安装 `psycopg[binary]` |
 | `node`/`pnpm` 命令未找到 | PATH 未刷新 | 重新打开 Git Bash，或在 `~/.bashrc` 中 `export PATH="$PATH:/c/Program Files/nodejs"` |
-| Redis Windows 端口不稳定 | 端口 6379 被占 | 改用 Docker 版 Redis，或修改 `redis.conf` 端口 |
+| Redis Windows 端口不稳定 | 端口 6379 被占 | 修改 `redis.conf` 端口或使用其他端口 |
 
 ---
 
@@ -227,7 +209,7 @@ pnpm dev --host 127.0.0.1 --port 3000
   alembic upgrade head
   pnpm build  # 如需产物
   ```
-- **关闭服务**：`Ctrl+C` 终止前端/后端；若使用 Docker 承载数据库，运行 `docker stop ca-postgres ca-redis`。
+- **关闭服务**：`Ctrl+C` 终止前端/后端。
 
 ---
 

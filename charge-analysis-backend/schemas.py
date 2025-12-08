@@ -63,9 +63,30 @@ class AnalysisRead(BaseModel):
         from_attributes = True
 
 
+class AnalysisRunRequest(BaseModel):
+    """分析运行请求"""
+    signal_names: Optional[list[str]] = Field(
+        default=None,
+        description="要解析的信号名称列表，如果为空则解析所有信号"
+    )
+
+
 class AnalysisRunResponse(BaseModel):
     analysis_id: int
     status: str
+
+
+class SignalInfo(BaseModel):
+    """信号信息"""
+    name: str
+    message_name: str
+    message_id: str
+
+
+class AvailableSignalsResponse(BaseModel):
+    """可用信号列表响应"""
+    signals: list[SignalInfo]
+    total_count: int
 
 
 class AnalysisListResponse(BaseModel):

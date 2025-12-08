@@ -8,6 +8,7 @@ env/
 venv/
 ENV/
 .venv
+myenv/
 pip-log.txt
 pip-delete-this-directory.txt
 .pytest_cache/
@@ -42,7 +43,7 @@ build/
 .DS_Store
 
 # Environment variables
-.env
+# .env - 已移除，允许提交到仓库
 .env.local
 .env.*.local
 

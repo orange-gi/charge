@@ -12,7 +12,14 @@ from config import get_settings
 from core.dependencies import get_current_user
 from database import get_db
 from models import AnalysisResult, AnalysisStatus, ChargingAnalysis, User
-from schemas import AnalysisListResponse, AnalysisRead, AnalysisRunResponse
+from schemas import (
+    AnalysisListResponse, 
+    AnalysisRead, 
+    AnalysisRunRequest,
+    AnalysisRunResponse,
+    AvailableSignalsResponse,
+    SignalInfo
+)
 from services.analysis_service import get_analysis_service
 
 router = APIRouter(prefix="/api/analyses", tags=["analyses"])
@@ -68,13 +75,56 @@ async def upload_analysis(
     return AnalysisRead.model_validate(analysis)
 
 
+@router.get("/signals/available", response_model=AvailableSignalsResponse)
+def get_available_signals() -> AvailableSignalsResponse:
+    """获取 DBC 文件中所有可用的信号列表"""
+    from services.can_parser import CANLogParser
+    
+    try:
+        parser = CANLogParser()
+        all_signals = parser.get_available_signals()
+        messages = parser.get_available_messages()
+        
+        # 构建消息ID到消息名称的映射
+        message_id_to_name = {msg['frame_id']: msg['name'] for msg in messages}
+        
+        # 构建信号信息列表
+        signal_infos = []
+        signal_to_message_ids = parser._signal_to_message_ids
+        
+        for signal_name in sorted(all_signals):
+            # 获取包含此信号的消息ID
+            message_ids = signal_to_message_ids.get(signal_name, [])
+            if message_ids:
+                # 使用第一个消息的信息
+                first_msg_id = message_ids[0]
+                message_name = message_id_to_name.get(first_msg_id, "Unknown")
+                signal_infos.append(SignalInfo(
+                    name=signal_name,
+                    message_name=message_name,
+                    message_id=hex(first_msg_id)
+                ))
+        
+        return AvailableSignalsResponse(
+            signals=signal_infos,
+            total_count=len(signal_infos)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取信号列表失败: {str(e)}"
+        )
+
+
 @router.post("/{analysis_id}/run", response_model=AnalysisRunResponse)
 async def run_analysis(
     analysis_id: int,
+    request: AnalysisRunRequest,
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AnalysisRunResponse:
+    """运行分析，支持选择特定信号进行解析"""
     analysis = (
         db.query(ChargingAnalysis)
         .filter(ChargingAnalysis.id == analysis_id, ChargingAnalysis.user_id == user.id)
@@ -92,8 +142,41 @@ async def run_analysis(
     db.add(analysis)
     db.commit()
 
-    background_tasks.add_task(analysis_service.run_analysis, analysis_id)
+    # 传递信号列表给分析服务
+    signal_names = request.signal_names if request.signal_names else None
+    background_tasks.add_task(analysis_service.run_analysis, analysis_id, signal_names)
     return AnalysisRunResponse(analysis_id=analysis_id, status="processing")
+
+
+@router.post("/{analysis_id}/cancel", response_model=dict)
+def cancel_analysis(
+    analysis_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """取消分析（总是成功）
+    
+    无论分析是否在运行中，都会成功返回：
+    - 如果任务正在运行，则停止它
+    - 如果任务不在运行，则更新数据库状态为已取消
+    """
+    analysis = (
+        db.query(ChargingAnalysis)
+        .filter(ChargingAnalysis.id == analysis_id, ChargingAnalysis.user_id == user.id)
+        .first()
+    )
+    if analysis is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析不存在")
+
+    # 无论状态如何，都执行取消操作（总是成功）
+    cancelled = analysis_service.cancel_analysis(analysis_id)
+    
+    # cancel_analysis 总是返回 True，所以这里总是成功
+    return {
+        "message": "分析已取消",
+        "analysis_id": analysis_id,
+        "was_running": analysis.status == AnalysisStatus.PROCESSING
+    }
 
 
 @router.get("/{analysis_id}", response_model=AnalysisRead)
@@ -108,7 +191,7 @@ def get_analysis(analysis_id: int, user: User = Depends(get_current_user), db: S
     return AnalysisRead.model_validate(analysis)
 
 
-@router.delete("/{analysis_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{analysis_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_analysis(analysis_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> None:
     analysis = (
         db.query(ChargingAnalysis)
@@ -127,6 +210,8 @@ def delete_analysis(analysis_id: int, user: User = Depends(get_current_user), db
             file_path.unlink()
         except OSError:
             pass
+    
+    return None
 
 
 @router.get("/{analysis_id}/results")

@@ -7,6 +7,7 @@ LangGraph 工作流实现
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Dict, Any, List, Optional, TypedDict
 from datetime import datetime
 from enum import Enum
@@ -131,46 +132,93 @@ class FileValidationNode:
 
 
 class MessageParsingNode:
-    """报文解析节点"""
+    """报文解析节点 - 基于 DBC 文件解析 CAN 日志"""
     
     def __init__(self):
-        self.filter_signals = [
-            'CHM_ComVersion', 'BMS_DCChrgSt', 'CCS_OutputCurent',
-            'CRM_RecognitionResult', 'BMS_DCChrgConnectSt',
-            'BMS_BattCurrt', 'BCL_CurrentRequire', 'BMS_ChrgEndNum',
-            'BMS_PackSOCDisp', 'CRO_ChargeReady', 'BRO_BMSChargeReady'
+        # 关键信号列表（GBT 27930-2015 标准中的充电相关信号）
+        # 注意：实际信号名称可能因 DBC 文件而异，这里使用通用关键词匹配
+        # 系统会自动根据 DBC 文件中实际存在的信号进行匹配
+        self.filter_keywords = [
+            'BMS', 'Chrg', 'SOC', 'Batt',      # 电池管理系统相关
+            'Current', 'Voltage', 'Temp',      # 电气参数
+            'State', 'Ready', 'Connect',       # 状态信息
+            'Output', 'Max', 'Min',            # 输出参数
         ]
+        
+        # 初始化 CAN 解析器并获取实际可用的信号
+        from services.can_parser import CANLogParser
+        # DBC 文件位于 services 目录下，使用相对路径
+        # 如果 CANLogParser 未指定路径，它会自动查找默认位置
+        self.can_parser = CANLogParser()  # 使用默认路径
+        
+        # 根据关键词过滤出实际存在的信号
+        all_signals = self.can_parser.get_available_signals()
+        self.filter_signals = [
+            sig for sig in all_signals 
+            if any(keyword.lower() in sig.lower() for keyword in self.filter_keywords)
+        ]
+        
+        logger.info(f"已加载 {len(self.filter_signals)} 个充电相关信号用于分析")
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理报文解析"""
         file_path = state['file_path']
         
         try:
-            # 模拟解析过程
             if state.get('progress_callback'):
-                await state['progress_callback']("报文解析", 20, "开始解析报文数据...")
+                await state['progress_callback']("报文解析", 15, "开始解析 CAN 日志...")
             
-            # 实际解析逻辑（这里用模拟数据）
-            df_parsed = await self._parse_file(file_path, self.filter_signals)
+            # 获取用户选择的信号列表，如果未指定则使用默认过滤信号
+            selected_signals = state.get('selected_signals')
+            if selected_signals:
+                # 使用用户选择的信号（仅解析这些信号，极大提升速度）
+                filter_signals = selected_signals
+                logger.info(f"使用用户选择的 {len(filter_signals)} 个信号进行解析")
+            else:
+                # 使用默认的过滤信号列表
+                filter_signals = self.filter_signals
+                logger.info(f"使用默认的 {len(filter_signals)} 个充电相关信号进行解析")
+            
+            # 检查文件类型
+            file_ext = Path(file_path).suffix.lower()
+            
+            if file_ext == '.blf':
+                # 使用 CAN 解析器解析 BLF 文件（高性能版本）
+                df_parsed = await self.can_parser.parse_blf(
+                    file_path,
+                    filter_signals=filter_signals,
+                    progress_callback=state.get('progress_callback')
+                )
+            else:
+                # 其他格式（CSV等）使用备用方法
+                logger.warning(f"不支持的文件格式: {file_ext}，使用备用解析方法")
+                df_parsed = await self._parse_file_fallback(file_path, filter_signals)
+            
+            if df_parsed.empty:
+                raise ValueError("未能从日志文件中解析出任何数据")
             
             # 数据预处理和清洗
+            if state.get('progress_callback'):
+                await state['progress_callback']("报文解析", 85, "正在进行数据清洗...")
+            
             df_cleaned = await self._clean_data(df_parsed)
             
             # 提取关键统计信息
             stats = await self._extract_statistics(df_cleaned)
             
             if state.get('progress_callback'):
-                await state['progress_callback']("报文解析", 40, "报文解析完成")
+                await state['progress_callback']("报文解析", 100, "报文解析完成")
             
             return {
                 **state,
                 'parsed_data': df_cleaned,
                 'data_stats': stats,
-                'parsing_status': 'completed'
+                'parsing_status': 'completed',
+                'dbc_signals': self.can_parser.get_available_signals()
             }
             
         except Exception as e:
-            logger.error(f"报文解析失败: {str(e)}")
+            logger.error(f"报文解析失败: {str(e)}", exc_info=True)
             if state.get('progress_callback'):
                 await state['progress_callback']("报文解析", 0, f"报文解析失败: {str(e)}")
             
@@ -181,62 +229,102 @@ class MessageParsingNode:
                 'analysis_status': AnalysisStatus.FAILED
             }
     
-    async def _parse_file(self, file_path: str, filter_signals: List[str]) -> pd.DataFrame:
-        """解析文件"""
-        # 模拟解析过程
-        await asyncio.sleep(2)  # 模拟处理时间
+    async def _parse_file_fallback(self, file_path: str, filter_signals: List[str]) -> pd.DataFrame:
+        """备用文件解析方法（用于非 BLF 格式）"""
+        logger.info(f"使用备用方法解析文件: {file_path}")
+        file_ext = Path(file_path).suffix.lower()
         
-        # 生成模拟数据
-        import numpy as np
-        n_samples = 1000
-        
-        data = {
-            'ts': pd.date_range('2025-11-19', periods=n_samples, freq='1S'),
-            'BMS_DCChrgSt': np.random.choice([0, 1, 2, 3], n_samples),
-            'BMS_BattCurrt': np.random.normal(25, 5, n_samples),
-            'BCL_CurrentRequire': np.random.normal(30, 3, n_samples),
-            'BMS_PackSOCDisp': np.random.uniform(20, 90, n_samples),
-            'BMS_ChrgEndNum': np.random.randint(0, 10, n_samples)
-        }
-        
-        df = pd.DataFrame(data)
-        df['ts'] = pd.to_datetime(df['ts'])
-        
-        return df
+        if file_ext == '.csv':
+            # 读取 CSV 文件
+            df = pd.read_csv(file_path)
+            # 尝试转换时间戳列
+            for col in ['timestamp', 'ts', 'time', 'Time']:
+                if col in df.columns:
+                    df['ts'] = pd.to_datetime(df[col])
+                    break
+            return df
+        else:
+            # 其他格式暂不支持
+            raise ValueError(f"不支持的文件格式: {file_ext}，仅支持 .blf 和 .csv 格式")
     
     async def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """数据清洗"""
-        # 移除空值
-        df_cleaned = df.dropna(subset=['BMS_DCChrgSt'])
+        """数据清洗，基于实际数据列"""
+        df_cleaned = df.copy()
         
-        # 移除异常值
-        df_cleaned = df_cleaned[
-            (df_cleaned['BMS_BattCurrt'] > -100) & 
-            (df_cleaned['BMS_BattCurrt'] < 100)
-        ]
+        # 排除元数据列
+        metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+        signal_columns = [col for col in df_cleaned.columns if col not in metadata_columns]
+        
+        # 移除所有信号列的空值（如果某行所有信号都为空，则删除该行）
+        if signal_columns:
+            df_cleaned = df_cleaned.dropna(subset=signal_columns[:5], how='all')  # 至少前5个信号不全为空
+        
+        # 对数值型信号移除明显异常值（超出合理范围的值）
+        for col in signal_columns:
+            if col not in df_cleaned.columns:
+                continue
+            if pd.api.types.is_numeric_dtype(df_cleaned[col]):
+                # 使用IQR方法检测异常值
+                Q1 = df_cleaned[col].quantile(0.25)
+                Q3 = df_cleaned[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 3 * IQR  # 使用3倍IQR以保留更多数据
+                upper_bound = Q3 + 3 * IQR
+                # 只过滤极端异常值
+                df_cleaned = df_cleaned[
+                    (df_cleaned[col] >= lower_bound) & 
+                    (df_cleaned[col] <= upper_bound)
+                ]
         
         return df_cleaned
     
     async def _extract_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """提取统计信息"""
+        """提取统计信息，基于实际解析的信号列"""
+        # 排除元数据列
+        metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+        signal_columns = [col for col in df.columns if col not in metadata_columns]
+        
+        signal_stats = {}
+        for col in signal_columns:
+            if col not in df.columns:
+                continue
+                
+            try:
+                # 尝试数值统计
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    signal_stats[col] = {
+                        'mean': float(df[col].mean()),
+                        'std': float(df[col].std()),
+                        'min': float(df[col].min()),
+                        'max': float(df[col].max()),
+                        'type': 'numeric'
+                    }
+                else:
+                    # 分类统计
+                    unique_vals = df[col].dropna().unique()
+                    if len(unique_vals) <= 20:  # 只对类别数较少的列统计分布
+                        signal_stats[col] = {
+                            'unique_values': unique_vals.tolist(),
+                            'distribution': df[col].value_counts().to_dict(),
+                            'type': 'categorical'
+                        }
+                    else:
+                        signal_stats[col] = {
+                            'unique_count': len(unique_vals),
+                            'type': 'categorical_many'
+                        }
+            except Exception as e:
+                logger.warning(f"提取信号 {col} 统计信息失败: {e}")
+                continue
+        
         stats = {
             'total_records': len(df),
             'time_range': {
-                'start': df['ts'].min().isoformat(),
-                'end': df['ts'].max().isoformat()
+                'start': df['ts'].min().isoformat() if 'ts' in df.columns else '',
+                'end': df['ts'].max().isoformat() if 'ts' in df.columns else ''
             },
-            'signal_stats': {
-                'BMS_DCChrgSt': {
-                    'unique_values': df['BMS_DCChrgSt'].unique().tolist(),
-                    'distribution': df['BMS_DCChrgSt'].value_counts().to_dict()
-                },
-                'BMS_BattCurrt': {
-                    'mean': float(df['BMS_BattCurrt'].mean()),
-                    'std': float(df['BMS_BattCurrt'].std()),
-                    'min': float(df['BMS_BattCurrt'].min()),
-                    'max': float(df['BMS_BattCurrt'].max())
-                }
-            }
+            'signal_stats': signal_stats,
+            'signal_count': len(signal_columns)
         }
         
         return stats
@@ -244,13 +332,6 @@ class MessageParsingNode:
 
 class FlowControlModelNode:
     """流程控制模型节点"""
-    
-    def __init__(self):
-        self.signal_definitions = {
-            'charging_status': 'BMS_DCChrgSt',
-            'battery_current': 'BMS_BattCurrt', 
-            'current_requirement': 'BCL_CurrentRequire'
-        }
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理流程控制模型分析"""
@@ -293,15 +374,37 @@ class FlowControlModelNode:
             }
     
     def _build_prompt(self, stats: Dict[str, Any]) -> str:
-        """构建提示"""
+        """构建提示，基于实际解析的信号"""
+        signal_stats = stats.get('signal_stats', {})
+        
+        # 构建信号统计描述
+        signal_descriptions = []
+        for signal_name, signal_data in signal_stats.items():
+            if signal_data.get('type') == 'numeric':
+                signal_descriptions.append(
+                    f"- {signal_name}: 均值={signal_data.get('mean', 0):.2f}, "
+                    f"标准差={signal_data.get('std', 0):.2f}, "
+                    f"范围=[{signal_data.get('min', 0):.2f}, {signal_data.get('max', 0):.2f}]"
+                )
+            elif signal_data.get('type') == 'categorical':
+                dist = signal_data.get('distribution', {})
+                if dist:
+                    signal_descriptions.append(
+                        f"- {signal_name}: 分布={dist}"
+                    )
+        
+        signals_text = "\n".join(signal_descriptions[:10])  # 限制显示前10个信号
+        if len(signal_descriptions) > 10:
+            signals_text += f"\n... 还有 {len(signal_descriptions) - 10} 个信号"
+        
         prompt = f"""
 充电数据分析：
 总记录数: {stats['total_records']}
+解析信号数: {stats.get('signal_count', 0)}
 时间范围: {stats['time_range']['start']} 至 {stats['time_range']['end']}
 
-关键信号统计：
-- 充电状态分布: {stats['signal_stats']['BMS_DCChrgSt']['distribution']}
-- 电池电流统计: 均值={stats['signal_stats']['BMS_BattCurrt']['mean']:.2f}, 标准差={stats['signal_stats']['BMS_BattCurrt']['std']:.2f}
+信号统计：
+{signals_text}
 
 请根据这些数据分析可能的问题方向。输出格式为JSON。
 """
@@ -378,16 +481,23 @@ class RAGRetrievalNode:
             }
     
     def _build_retrieval_query(self, problem_direction: str, df: pd.DataFrame) -> str:
-        """构建检索查询"""
+        """构建检索查询，基于实际数据特征"""
         base_query = f"充电系统{problem_direction}"
         
-        # 基于数据特征调整查询
-        if 'BMS_DCChrgSt' in df.columns:
-            status_dist = df['BMS_DCChrgSt'].value_counts().to_dict()
-            if 0 in status_dist:
-                base_query += " 充电连接问题"
-            if 2 in status_dist:
-                base_query += " 充电中异常"
+        # 基于实际数据特征调整查询
+        # 查找可能的状态信号（包含 status, state, st 等关键词）
+        status_signals = [col for col in df.columns if any(keyword in col.lower() for keyword in ['status', 'state', 'st'])]
+        
+        if status_signals:
+            # 使用第一个找到的状态信号
+            status_col = status_signals[0]
+            try:
+                status_dist = df[status_col].value_counts().to_dict()
+                # 根据状态分布添加查询关键词
+                if status_dist:
+                    base_query += f" {status_col}异常"
+            except Exception:
+                pass
         
         return base_query
     
@@ -484,23 +594,37 @@ class DetailedAnalysisNode:
             }
     
     async def _extract_refined_signals(self, direction: str, context: str, df: pd.DataFrame) -> List[str]:
-        """提取细化信号"""
-        signal_mapping = {
-            'charging_connection': ['BMS_DCChrgConnectSt', 'BMS_Cc2SngR'],
-            'charging_current': ['BCL_CurrentRequire', 'BMS_ChrgCurrtLkUp'],
-            'charging_voltage': ['CML_OutputVoltageMax', 'CML_OutputCurentMax'],
-            'battery_soc': ['BMS_PackSOCDisp']
+        """提取细化信号，基于实际数据列和问题方向"""
+        # 排除元数据列
+        metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+        available_columns = [col for col in df.columns if col not in metadata_columns]
+        
+        # 根据问题方向关键词匹配相关信号
+        direction_lower = direction.lower()
+        relevant_signals = []
+        
+        # 根据问题方向的关键词匹配信号名称
+        keywords_mapping = {
+            'connection': ['connect', 'link', 'attach'],
+            'current': ['current', 'currt', 'ampere'],
+            'voltage': ['voltage', 'volt', 'vlt'],
+            'soc': ['soc', 'state_of_charge', 'battery_level'],
+            'temperature': ['temp', 'temperature', 'thermal'],
+            'status': ['status', 'state', 'st']
         }
         
-        relevant_signals = []
-        for category, signals in signal_mapping.items():
-            if category in direction:
-                relevant_signals.extend(signals)
+        for keyword, patterns in keywords_mapping.items():
+            if keyword in direction_lower:
+                # 查找包含这些关键词的信号
+                matched = [col for col in available_columns 
+                          if any(pattern.lower() in col.lower() for pattern in patterns)]
+                relevant_signals.extend(matched)
         
-        # 确保信号在数据中存在
-        available_signals = [s for s in relevant_signals if s in df.columns]
+        # 如果没有匹配到，返回前几个可用的信号
+        if not relevant_signals:
+            relevant_signals = available_columns[:5]  # 返回前5个信号
         
-        return list(set(available_signals))
+        return list(set(relevant_signals))
     
     async def _validate_signals(self, df: pd.DataFrame, signals: List[str]) -> Dict[str, Any]:
         """验证信号"""
@@ -598,18 +722,42 @@ class LLMAnalysisNode:
     
     def _build_analysis_prompt(self, direction: str, context: str, stats: Dict, 
                               signals: List[str], validation: Dict) -> str:
-        """构建分析提示"""
+        """构建分析提示，基于实际信号统计"""
+        signal_stats = stats.get('signal_stats', {})
+        
+        # 构建信号统计描述
+        signal_descriptions = []
+        for signal_name in signals[:10]:  # 限制显示前10个信号
+            if signal_name in signal_stats:
+                signal_data = signal_stats[signal_name]
+                if signal_data.get('type') == 'numeric':
+                    signal_descriptions.append(
+                        f"  - {signal_name}: 均值={signal_data.get('mean', 0):.2f}, "
+                        f"范围=[{signal_data.get('min', 0):.2f}, {signal_data.get('max', 0):.2f}]"
+                    )
+                elif signal_data.get('type') == 'categorical':
+                    dist = signal_data.get('distribution', {})
+                    if dist:
+                        signal_descriptions.append(
+                            f"  - {signal_name}: 分布={dist}"
+                        )
+        
+        signals_text = "\n".join(signal_descriptions) if signal_descriptions else "  - 无详细统计"
+        
         prompt = f"""
 基于以下充电数据分析，生成详细的诊断报告：
 
 问题方向：{direction}
-相关信号：{', '.join(signals)}
+相关信号：{', '.join(signals[:10])}{'...' if len(signals) > 10 else ''}
 信号验证结果：{validation.get('average_quality', 0):.2f}
 
 数据统计：
 - 总记录数：{stats.get('total_records', 0)}
-- 时间范围：{stats.get('time_range', {})}
-- 充电状态分布：{stats.get('signal_stats', {}).get('BMS_DCChrgSt', {}).get('distribution', {})}
+- 解析信号数：{stats.get('signal_count', 0)}
+- 时间范围：{stats.get('time_range', {}).get('start', '')} 至 {stats.get('time_range', {}).get('end', '')}
+
+信号统计：
+{signals_text}
 
 相关知识：
 {context[:1000]}...
@@ -741,19 +889,40 @@ class ReportGenerationNode:
         
         visualizations = []
         
-        # 时间序列图
-        if 'BMS_DCChrgSt' in df.columns:
+        # 排除元数据列
+        metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+        signal_columns = [col for col in df.columns if col not in metadata_columns]
+        
+        if not signal_columns:
+            return visualizations
+        
+        # 时间序列图 - 使用前几个数值型信号
+        numeric_signals = [col for col in signal_columns 
+                          if pd.api.types.is_numeric_dtype(df[col])][:3]
+        if numeric_signals:
             visualizations.append({
                 'type': 'line_chart',
-                'title': '充电状态变化趋势',
-                'signals': ['BMS_DCChrgSt', 'BMS_BattCurrt']
+                'title': '信号变化趋势',
+                'signals': numeric_signals
             })
         
-        # 电流分布直方图
-        if 'BMS_BattCurrt' in df.columns:
+        # 分布直方图 - 使用第一个数值型信号
+        if numeric_signals:
             visualizations.append({
                 'type': 'histogram',
-                'title': '电池电流分布'
+                'title': f'{numeric_signals[0]} 分布',
+                'signals': [numeric_signals[0]]
+            })
+        
+        # 分类信号分布图
+        categorical_signals = [col for col in signal_columns 
+                              if not pd.api.types.is_numeric_dtype(df[col]) 
+                              and df[col].nunique() <= 10][:2]
+        if categorical_signals:
+            visualizations.append({
+                'type': 'bar_chart',
+                'title': '状态分布',
+                'signals': categorical_signals
             })
         
         return visualizations

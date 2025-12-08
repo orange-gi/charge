@@ -29,6 +29,17 @@ export interface AnalysisResult {
   createdAt: string;
 }
 
+export interface SignalInfo {
+  name: string;
+  messageName: string;
+  messageId: string;
+}
+
+export interface AvailableSignalsResponse {
+  signals: SignalInfo[];
+  totalCount: number;
+}
+
 interface BackendAnalysis {
   id: number;
   name: string;
@@ -83,8 +94,36 @@ export const chargingService = {
     return transformAnalysisData(data);
   },
 
-  async startAnalysis(analysisId: number, token: string): Promise<void> {
+  async getAvailableSignals(token: string): Promise<AvailableSignalsResponse> {
+    // Backend returns snake_case, we normalize it
+    const data = await apiRequest<any>('/api/analyses/signals/available', {
+      token
+    });
+    return {
+      signals: data.signals || data.signal_infos || [],
+      totalCount: data.total_count || data.totalCount || 0
+    };
+  },
+
+  async startAnalysis(analysisId: number, token: string, signalNames?: string[]): Promise<void> {
+    const body: { signal_names?: string[] } = {};
+    if (signalNames && signalNames.length > 0) {
+      body.signal_names = signalNames;
+    }
+    
     await apiRequest(`/api/analyses/${analysisId}/run`, {
+      method: 'POST',
+      token,
+      body: body  // apiRequest 会自动处理 JSON 序列化
+    });
+  },
+
+  async cancelAnalysis(analysisId: number, token: string): Promise<void> {
+    if (!analysisId) {
+      throw new Error('分析ID不能为空');
+    }
+    console.log(`取消分析请求: analysisId=${analysisId}`);
+    await apiRequest(`/api/analyses/${analysisId}/cancel`, {
       method: 'POST',
       token
     });

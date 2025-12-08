@@ -41,11 +41,44 @@
 
 ## 快速开始
 
+> 📖 **详细启动指南**: 查看 [QUICK_START.md](./QUICK_START.md) 了解完整的启动步骤。
+
+### 数据库服务安装
+
+项目支持两种方式运行 PostgreSQL 和 Redis：
+
+#### 方式 1: 本地安装（推荐）
+
+使用 Homebrew 在本地安装并运行服务：
+
+```bash
+# 安装 PostgreSQL 和 Redis
+brew install postgresql@16 redis
+
+# 启动服务
+brew services start postgresql@16
+brew services start redis
+
+# 或使用管理脚本
+./manage-local-services.sh start
+```
+
+**服务配置：**
+- PostgreSQL: `localhost:5432`
+  - 数据库: `charge_analysis`
+  - 用户: `orange` (系统用户，无需密码)
+- Redis: `localhost:6379`
+
+> 📖 **详细配置**: 查看 [LOCAL_SETUP.md](./LOCAL_SETUP.md) 了解本地安装和配置详情。
+
 ### 后端设置
 
 ```bash
 cd charge-analysis-backend
 pip install -r requirements.txt
+
+# 初始化数据库（在数据库服务启动后）
+python -c "from database import init_db; init_db()"
 ```
 
 ### 前端设置
@@ -58,7 +91,43 @@ pnpm dev
 
 ## 文档
 
-详细文档请查看 [docs/](./docs/) 目录。
+- 📚 [快速启动指南](./QUICK_START.md) - 完整的本地开发环境搭建指南
+- 🖥️ [本地服务安装指南](./LOCAL_SETUP.md) - 使用 Homebrew 安装 PostgreSQL 和 Redis
+- 📦 [Pip 镜像源配置](./PIP_MIRROR_SETUP.md) - 配置 pip 使用国内镜像源加速下载
+- 📖 [部署指南](./docs/deployment/deployment_guide.md) - Windows 本地部署指南
+- 📋 更多文档请查看 [docs/](./docs/) 目录
+
+## 加速配置
+
+### Pip 镜像源
+
+项目已配置使用阿里云镜像源加速 Python 包下载：
+
+```bash
+# 运行配置脚本（如果还没配置）
+./setup-pip-mirror.sh
+
+# 验证配置
+pip config list
+```
+
+详细配置说明请查看 [PIP_MIRROR_SETUP.md](./PIP_MIRROR_SETUP.md)。
+
+### Python 版本
+
+项目使用 **Python 3.12** 作为默认版本：
+
+```bash
+# 检查当前 Python 版本
+python3 --version
+
+# 如果版本不对，重新加载配置
+source ~/.zshrc
+```
+
+项目已配置为全局使用 Python 3.12，所有启动脚本会自动使用 Python 3.12。
+
+详细配置说明请查看 [PYTHON312_SETUP.md](./PYTHON312_SETUP.md)。
 
 ## 许可证
 

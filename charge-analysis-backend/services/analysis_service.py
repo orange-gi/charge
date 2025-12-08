@@ -1,6 +1,7 @@
 """充电分析调度与结果持久化服务。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -17,28 +18,119 @@ class AnalysisService:
 
     def __init__(self) -> None:
         self.workflow = ChargingAnalysisWorkflow()
+        # 存储正在运行的分析任务，用于取消操作
+        self._running_tasks: Dict[int, asyncio.Task] = {}
+        self._cancellation_flags: Dict[int, bool] = {}
 
-    async def run_analysis(self, analysis_id: int) -> None:
-        """执行工作流并将结果写入数据库。"""
-        logger.info("开始执行分析 %s", analysis_id)
-        initial_state = self._build_initial_state(analysis_id)
+    async def run_analysis(self, analysis_id: int, signal_names: list[str] | None = None) -> None:
+        """执行工作流并将结果写入数据库。
+        
+        Args:
+            analysis_id: 分析ID
+            signal_names: 要解析的信号名称列表，如果为None则解析所有信号
+        """
+        logger.info("=" * 60)
+        logger.info(f"开始执行分析任务 ID: {analysis_id}")
+        logger.info(f"信号列表: {signal_names if signal_names else '全部信号'}")
+        logger.info("=" * 60)
+        
+        # 检查是否已取消
+        self._cancellation_flags[analysis_id] = False
+        
+        initial_state = self._build_initial_state(analysis_id, signal_names)
         if initial_state is None:
             logger.error("分析 %s 不存在，终止", analysis_id)
             return
 
+        # 创建任务并存储引用
+        task = asyncio.create_task(self._execute_analysis(analysis_id, initial_state))
+        self._running_tasks[analysis_id] = task
+
         try:
+            await task
+        except asyncio.CancelledError:
+            logger.warning(f"分析 {analysis_id} 被用户取消")
+            self._mark_cancelled(analysis_id)
+        finally:
+            # 清理任务引用
+            self._running_tasks.pop(analysis_id, None)
+            self._cancellation_flags.pop(analysis_id, None)
+
+    async def _execute_analysis(self, analysis_id: int, initial_state: Dict[str, Any]) -> None:
+        """实际执行分析逻辑"""
+        try:
+            logger.info(f"执行分析工作流: {analysis_id}")
             final_state = await self.workflow.execute(initial_state)
+            
+            # 检查是否已取消
+            if self._cancellation_flags.get(analysis_id, False):
+                logger.warning(f"分析 {analysis_id} 在执行过程中被取消")
+                return
+            
+            # 检查工作流是否失败
+            workflow_status = final_state.get("analysis_status")
+            if workflow_status == WorkflowStatus.FAILED:
+                error_message = final_state.get("error_message", "工作流执行失败")
+                logger.error(f"分析 {analysis_id} 工作流失败: {error_message}")
+                self._mark_failed(analysis_id, error_message)
+                return
+                
             await self._persist_success_state(analysis_id, final_state)
-            logger.info("分析 %s 完成", analysis_id)
+            logger.info(f"分析 {analysis_id} 完成")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # pragma: no cover - 仅用于兜底
-            logger.exception("分析 %s 执行失败: %s", analysis_id, exc)
+            logger.exception(f"分析 {analysis_id} 执行失败: {exc}")
             self._mark_failed(analysis_id, str(exc))
 
-    def _build_initial_state(self, analysis_id: int) -> Dict[str, Any] | None:
+    def cancel_analysis(self, analysis_id: int) -> bool:
+        """取消正在运行的分析任务
+        
+        无论任务是否存在，都会返回 True 表示操作成功。
+        如果任务正在运行则取消它，如果没有任务则更新数据库状态。
+        
+        Returns:
+            bool: 总是返回 True（操作成功）
+        """
+        cancelled_task = False
+        
+        # 如果有正在运行的任务，尝试取消它
+        if analysis_id in self._running_tasks:
+            logger.info(f"找到正在运行的分析任务: {analysis_id}，准备取消")
+            self._cancellation_flags[analysis_id] = True
+            task = self._running_tasks[analysis_id]
+            if not task.done():
+                task.cancel()
+                cancelled_task = True
+                logger.info(f"分析任务 {analysis_id} 已标记为取消")
+            else:
+                logger.info(f"分析任务 {analysis_id} 已完成或已停止")
+        else:
+            logger.info(f"分析任务 {analysis_id} 不在运行队列中")
+        
+        # 无论如何，都更新数据库状态为已取消
+        # 这样即使任务不在运行，也能标记为已取消
+        if not cancelled_task:
+            logger.info(f"更新分析 {analysis_id} 的状态为已取消")
+            self._mark_cancelled(analysis_id)
+        
+        return True  # 总是返回成功
+
+    def _build_initial_state(self, analysis_id: int, signal_names: list[str] | None = None) -> Dict[str, Any] | None:
+        # 在会话内提取所有需要的属性值，避免会话分离后的访问错误
+        file_path_str: str | None = None
+        file_size: int | None = None
+        user_id: int | None = None
+        
         with session_scope() as session:
             analysis: ChargingAnalysis | None = session.get(ChargingAnalysis, analysis_id)
             if analysis is None:
                 return None
+
+            # 在会话内提取所有需要的属性值
+            file_path_str = analysis.file_path
+            file_size = analysis.file_size
+            user_id = analysis.user_id
 
             analysis.status = AnalysisStatus.PROCESSING
             analysis.progress = 5.0
@@ -46,29 +138,44 @@ class AnalysisService:
 
             session.add(analysis)
 
-        file_path = Path(analysis.file_path)
+        # 在会话外使用已提取的值
+        file_path = Path(file_path_str)
         progress_callback = self._progress_callback_factory(analysis_id)
 
         return {
             "analysis_id": str(analysis_id),
             "file_path": str(file_path),
             "file_name": file_path.name,
-            "file_size": analysis.file_size or 0,
-            "user_id": analysis.user_id,
+            "file_size": file_size or 0,
+            "user_id": user_id,
             "validation_status": "pending",
             "parsing_status": "pending",
             "iteration": 0,
             "analysis_status": WorkflowStatus.PENDING,
             "progress_callback": progress_callback,
             "start_time": datetime.utcnow(),
+            "selected_signals": signal_names,  # 添加用户选择的信号列表
         }
 
     def _progress_callback_factory(self, analysis_id: int):
         async def _progress(stage: str, progress: float, message: str | None = None) -> None:
-            logger.info("分析 %s 进度 %s%% - %s", analysis_id, progress, stage)
+            # 检查是否已取消
+            if self._cancellation_flags.get(analysis_id, False):
+                logger.info(f"分析 {analysis_id} 进度更新被取消请求中断 (阶段: {stage})")
+                return
+                
+            log_msg = f"分析 {analysis_id} 进度 {progress:.1f}% - {stage}"
+            if message:
+                log_msg += f": {message}"
+            logger.info(log_msg)
+            
             with session_scope() as session:
                 analysis = session.get(ChargingAnalysis, analysis_id)
                 if analysis is None:
+                    return
+                # 再次检查取消标志
+                if self._cancellation_flags.get(analysis_id, False):
+                    logger.debug(f"分析 {analysis_id} 在保存进度前被取消")
                     return
                 analysis.status = AnalysisStatus.PROCESSING
                 analysis.progress = float(progress)
@@ -98,14 +205,30 @@ class AnalysisService:
                 AnalysisResult.analysis_id == analysis_id
             ).delete(synchronize_session=False)
 
+            # 安全地获取最终报告摘要
+            final_report = summary_payload.get("final_report") or {}
+            summary_content = (
+                llm_analysis.get("summary") 
+                or (final_report.get("summary") if isinstance(final_report, dict) else "")
+                or state.get("error_message", "分析完成")
+            )
+            
+            # 安全地获取置信度分数
+            flow_analysis = summary_payload.get("flow_analysis") or {}
+            confidence_score = (
+                flow_analysis.get("confidence") 
+                if isinstance(flow_analysis, dict) 
+                else 0.0
+            )
+
             # 汇总结果
             session.add(
                 AnalysisResult(
                     analysis_id=analysis_id,
                     result_type="summary",
                     title="充电分析总结",
-                    content=llm_analysis.get("summary") or summary_payload.get("final_report", {}).get("summary", ""),
-                    confidence_score=summary_payload.get("flow_analysis", {}).get("confidence", 0.0),
+                    content=summary_content,
+                    confidence_score=confidence_score,
                     meta_info=json.dumps({"category": "overview", "risk": llm_analysis.get("risk_assessment")}, ensure_ascii=False),
                 )
             )
@@ -160,26 +283,72 @@ class AnalysisService:
 
     def _build_result_payload(self, state: Dict[str, Any]) -> Dict[str, Any]:
         def _serialize(obj: Any) -> Any:
+            """递归序列化对象，处理 numpy 和 pandas 类型"""
+            # 处理 None
+            if obj is None:
+                return None
+            
+            # 处理 datetime
             if isinstance(obj, datetime):
                 return obj.isoformat()
+            
+            # 处理 WorkflowStatus
+            if isinstance(obj, WorkflowStatus):
+                return obj.value
+            
+            # 处理 numpy 类型
+            try:
+                import numpy as np
+                if isinstance(obj, np.bool_):
+                    return bool(obj)
+                if isinstance(obj, (np.integer, np.intc, np.intp, np.int8,
+                                   np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                                   np.uint32, np.uint64)):
+                    return int(obj)
+                if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+            except ImportError:
+                pass  # numpy 未安装时跳过
+            
+            # 处理 pandas 类型
+            try:
+                import pandas as pd
+                if isinstance(obj, pd.Timestamp):
+                    return obj.isoformat()
+                if isinstance(obj, (pd.Series, pd.DataFrame)):
+                    return obj.to_dict() if isinstance(obj, pd.Series) else obj.to_dict(orient='records')
+            except ImportError:
+                pass  # pandas 未安装时跳过
+            
+            # 处理字典 - 递归处理值
+            if isinstance(obj, dict):
+                return {k: _serialize(v) for k, v in obj.items()}
+            
+            # 处理列表/元组 - 递归处理元素
+            if isinstance(obj, (list, tuple)):
+                return [_serialize(item) for item in obj]
+            
+            # 处理有 isoformat 方法的对象（如其他日期时间类型）
             if hasattr(obj, "isoformat"):
                 try:
                     return obj.isoformat()
                 except Exception:  # pragma: no cover
                     return str(obj)
-            if isinstance(obj, WorkflowStatus):
-                return obj.value
+            
+            # 其他类型直接返回
             return obj
 
         payload = {
             "analysis_status": _serialize(state.get("analysis_status")),
-            "flow_analysis": state.get("flow_analysis"),
-            "llm_analysis": state.get("llm_analysis"),
-            "data_stats": state.get("data_stats"),
-            "retrieved_documents": state.get("retrieved_documents"),
-            "final_report": state.get("final_report"),
-            "refined_signals": state.get("refined_signals"),
-            "signal_validation": state.get("signal_validation"),
+            "flow_analysis": _serialize(state.get("flow_analysis")),
+            "llm_analysis": _serialize(state.get("llm_analysis")),
+            "data_stats": _serialize(state.get("data_stats")),
+            "retrieved_documents": _serialize(state.get("retrieved_documents")),
+            "final_report": _serialize(state.get("final_report")),
+            "refined_signals": _serialize(state.get("refined_signals")),
+            "signal_validation": _serialize(state.get("signal_validation")),
             "timestamps": {
                 "start": _serialize(state.get("start_time")),
                 "end": _serialize(state.get("end_time")),
@@ -194,6 +363,17 @@ class AnalysisService:
                 return
             analysis.status = AnalysisStatus.FAILED
             analysis.error_message = message
+            analysis.completed_at = datetime.utcnow()
+            session.add(analysis)
+
+    def _mark_cancelled(self, analysis_id: int) -> None:
+        """标记分析为已取消"""
+        with session_scope() as session:
+            analysis = session.get(ChargingAnalysis, analysis_id)
+            if analysis is None:
+                return
+            analysis.status = AnalysisStatus.FAILED
+            analysis.error_message = "分析已被用户取消"
             analysis.completed_at = datetime.utcnow()
             session.add(analysis)
 

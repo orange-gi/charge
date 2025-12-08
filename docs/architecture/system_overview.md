@@ -90,7 +90,6 @@
 - **日志**: Loguru + Structlog
 
 ### 4.3 部署和运维
-- **容器化**: Docker + Docker Compose
 - **反向代理**: Nginx
 - **进程管理**: PM2 (后端) + serve (前端)
 - **监控**: Prometheus + Grafana

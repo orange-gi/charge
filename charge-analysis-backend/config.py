@@ -1,8 +1,9 @@
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+import json
 
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class Settings(BaseSettings):
@@ -104,13 +105,44 @@ class Settings(BaseSettings):
         env="ALLOWED_ORIGINS"
     )
     
+    @model_validator(mode="before")
+    @classmethod
+    def parse_list_fields(cls, data: Any) -> Any:
+        """解析列表字段，支持 JSON 或逗号分隔的字符串"""
+        if isinstance(data, dict):
+            # 处理 allowed_extensions
+            if "ALLOWED_EXTENSIONS" in data or "allowed_extensions" in data:
+                key = "ALLOWED_EXTENSIONS" if "ALLOWED_EXTENSIONS" in data else "allowed_extensions"
+                value = data[key]
+                if isinstance(value, str) and value:
+                    try:
+                        data[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        # 如果不是 JSON，则按逗号分隔
+                        data[key] = [ext.strip() for ext in value.split(",") if ext.strip()]
+            
+            # 处理 allowed_origins
+            if "ALLOWED_ORIGINS" in data or "allowed_origins" in data:
+                key = "ALLOWED_ORIGINS" if "ALLOWED_ORIGINS" in data else "allowed_origins"
+                value = data[key]
+                if isinstance(value, str) and value:
+                    try:
+                        data[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        # 如果不是 JSON，则按逗号分隔
+                        data[key] = [origin.strip() for origin in value.split(",") if origin.strip()]
+        
+        return data
+    
     # 日志配置
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
     log_file: Optional[Path] = Field(default=None, env="LOG_FILE")
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",  # 忽略额外的字段
+    }
 
 
 # 全局配置实例
