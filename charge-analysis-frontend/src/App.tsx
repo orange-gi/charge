@@ -2,7 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
 import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Select, Spin, Card, Space, Typography, Progress } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
-import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, PlayCircleOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined } from '@ant-design/icons';
+import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined } from '@ant-design/icons';
 import { useAuthStore } from './stores/authStore';
 import './styles/globals.css';
 
@@ -626,9 +626,10 @@ const ChargingPage = () => {
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+      const selectedFile = e.target.files[0];
+      setFile(selectedFile);
       // 如果当前状态是错误或失败，重置状态以允许重新上传
       if (status === 'error' || status === 'failed' || status === 'cancelled') {
         setStatus('idle');
@@ -638,6 +639,8 @@ const ChargingPage = () => {
         setAnalysisProgress(0);
         setProgressMessage('');
       }
+      
+      await handleUpload(selectedFile);
     }
   };
 
@@ -676,8 +679,9 @@ const ChargingPage = () => {
     }
   };
 
-  const handleUpload = async () => {
-    if (!file || !user || !token) return;
+  const handleUpload = async (selectedFile?: File) => {
+    const fileToUpload = selectedFile || file;
+    if (!fileToUpload || !user || !token) return;
 
     setStatus('uploading');
     setResults([]);
@@ -686,7 +690,7 @@ const ChargingPage = () => {
       const { chargingService } = await import('./services/chargingService');
       
       message.loading('上传中...', 0);
-      const analysis = await chargingService.uploadFile(file, token, file.name);
+      const analysis = await chargingService.uploadFile(fileToUpload, token, fileToUpload.name);
       message.destroy();
       message.success('文件上传成功');
       
@@ -1255,7 +1259,7 @@ const ChargingPage = () => {
               display: 'flex',
               alignItems: 'center',
               gap: '8px',
-              padding: (status === 'analyzing' || status === 'completed') ? '8px' : '12px 16px',
+              padding: (status === 'uploaded' || status === 'analyzing' || status === 'completed') ? '8px' : '12px 16px',
               background: 'white',
               border: '2px solid #2c5aa0',
               borderRadius: '8px',
@@ -1279,8 +1283,8 @@ const ChargingPage = () => {
               }
             }}
             >
-              {/* 分析开始后隐藏图标和文字，只显示删除按钮 */}
-              {(status === 'analyzing' || status === 'completed') ? (
+              {/* 成功上传后隐藏图标和文字，只显示删除按钮 */}
+              {(status === 'uploaded' || status === 'analyzing' || status === 'completed') ? (
                 <Button
                   type="text"
                   size="small"
@@ -1310,47 +1314,6 @@ const ChargingPage = () => {
                 </>
               )}
             </div>
-
-            {/* 上传按钮（如果文件还未上传） */}
-            {file && status !== 'uploaded' && status !== 'uploading' && status !== 'analyzing' && status !== 'completed' && (
-              <Button
-                type="primary"
-                icon={<UploadOutlined />}
-                onClick={handleUpload}
-                loading={status === 'uploading'}
-                style={{
-                  background: '#2c5aa0',
-                  borderColor: '#2c5aa0',
-                  height: '44px',
-                  padding: '0 20px',
-                  borderRadius: '8px',
-                  fontWeight: '500',
-                  flexShrink: 0
-                }}
-              >
-                {status === 'uploading' ? '上传中...' : '上传文件'}
-              </Button>
-            )}
-
-            {/* 开始分析按钮（如果文件已上传） */}
-            {status === 'uploaded' && (
-              <Button
-                type="primary"
-                icon={<PlayCircleOutlined />}
-                onClick={handleStartAnalysis}
-                style={{
-                  background: '#2c5aa0',
-                  borderColor: '#2c5aa0',
-                  height: '44px',
-                  padding: '0 20px',
-                  borderRadius: '8px',
-                  fontWeight: '500',
-                  flexShrink: 0
-                }}
-              >
-                开始分析
-              </Button>
-            )}
 
             {/* 动态流程卡片 */}
             {getCurrentSteps().slice(1).map((step, index) => {
