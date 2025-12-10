@@ -29,6 +29,18 @@ class AnalysisStatus(Enum):
     MAX_ITERATIONS = "max_iterations_reached"
 
 
+WORKFLOW_STEP_LABELS = {
+    "file_upload": "文件上传",
+    "file_validation": "文件验证",
+    "message_parsing": "报文解析",
+    "flow_control": "流程控制",
+    "rag_retrieval": "RAG检索",
+    "detailed_analysis": "细化分析",
+    "llm_analysis": "LLM分析",
+    "report_generation": "报告生成",
+}
+
+
 class ChargingAnalysisState(TypedDict):
     """充电分析工作流状态"""
     # 基础信息
@@ -72,6 +84,73 @@ class ChargingAnalysisState(TypedDict):
     end_time: Optional[datetime]
     error_message: Optional[str]
     progress_callback: Optional[callable]
+    
+    # 前端展示所需
+    workflow_trace: Optional[Dict[str, Any]]
+    parsed_data_records: Optional[List[Dict[str, Any]]]
+
+
+def _iso_now() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _ensure_trace_entry(state: ChargingAnalysisState, node_id: str) -> Dict[str, Any]:
+    trace = state.setdefault("workflow_trace", {})
+    entry = trace.get(node_id, {"node_id": node_id, "name": WORKFLOW_STEP_LABELS.get(node_id, node_id)})
+    trace[node_id] = entry
+    return entry
+
+
+def mark_node_started(state: ChargingAnalysisState, node_id: str, description: str | None = None, metadata: Dict[str, Any] | None = None) -> None:
+    entry = _ensure_trace_entry(state, node_id)
+    if "started_at" not in entry:
+        entry["started_at"] = _iso_now()
+    entry["status"] = "running"
+    if description:
+        entry["description"] = description
+    if metadata:
+        entry["metadata"] = metadata
+
+
+def mark_node_completed(state: ChargingAnalysisState, node_id: str, output: Dict[str, Any] | None = None) -> None:
+    entry = _ensure_trace_entry(state, node_id)
+    entry["status"] = "completed"
+    entry["ended_at"] = _iso_now()
+    if output is not None:
+        entry["output"] = output
+
+
+def mark_node_failed(state: ChargingAnalysisState, node_id: str, error_message: str) -> None:
+    entry = _ensure_trace_entry(state, node_id)
+    entry["status"] = "failed"
+    entry["ended_at"] = _iso_now()
+    entry["error"] = error_message
+
+
+def create_initial_workflow_trace(file_name: str, file_size: int | None, created_at: datetime | None = None) -> Dict[str, Any]:
+    """构建默认的节点追踪信息"""
+    timestamp = (created_at or datetime.utcnow()).isoformat()
+    trace: Dict[str, Any] = {
+        "file_upload": {
+            "node_id": "file_upload",
+            "name": WORKFLOW_STEP_LABELS.get("file_upload"),
+            "status": "completed",
+            "started_at": timestamp,
+            "ended_at": timestamp,
+            "output": {
+                "file_name": file_name,
+                "file_size": file_size or 0,
+            },
+            "description": "用户上传原始日志文件",
+        }
+    }
+    for node_id, node_name in WORKFLOW_STEP_LABELS.items():
+        trace.setdefault(node_id, {
+            "node_id": node_id,
+            "name": node_name,
+            "status": "pending",
+        })
+    return trace
 
 
 class FileValidationNode:
@@ -86,6 +165,7 @@ class FileValidationNode:
         file_path = state.get('file_path')
         file_name = state.get('file_name')
         file_size = state.get('file_size')
+        mark_node_started(state, "file_validation", "验证文件合法性")
         
         try:
             # 验证文件类型
@@ -104,23 +184,31 @@ class FileValidationNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("文件验证", 10, "文件验证通过")
             
-            return {
+            result_state = {
                 **state,
                 'validation_status': 'passed',
                 'validation_message': '文件验证通过'
             }
+            mark_node_completed(result_state, "file_validation", {
+                "file_size": file_size,
+                "file_name": file_name,
+                "status": "passed"
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"文件验证失败: {str(e)}")
             if state.get('progress_callback'):
                 await state['progress_callback']("文件验证", 0, f"文件验证失败: {str(e)}")
             
-            return {
+            failed_state = {
                 **state,
                 'validation_status': 'failed',
                 'error_message': str(e),
                 'analysis_status': AnalysisStatus.FAILED
             }
+            mark_node_failed(failed_state, "file_validation", str(e))
+            return failed_state
     
     async def _check_file_integrity(self, file_path: str) -> bool:
         """检查文件完整性"""
@@ -163,6 +251,7 @@ class MessageParsingNode:
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理报文解析"""
         file_path = state['file_path']
+        mark_node_started(state, "message_parsing", "解析 CAN 日志并提取信号")
         
         try:
             if state.get('progress_callback'):
@@ -209,25 +298,34 @@ class MessageParsingNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("报文解析", 100, "报文解析完成")
             
-            return {
+            parsed_records = df_cleaned.to_dict(orient='records')
+            result_state = {
                 **state,
                 'parsed_data': df_cleaned,
+                'parsed_data_records': parsed_records,
                 'data_stats': stats,
                 'parsing_status': 'completed',
                 'dbc_signals': self.can_parser.get_available_signals()
             }
+            mark_node_completed(result_state, "message_parsing", {
+                "records": len(parsed_records),
+                "signal_count": stats.get('signal_count', 0)
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"报文解析失败: {str(e)}", exc_info=True)
             if state.get('progress_callback'):
                 await state['progress_callback']("报文解析", 0, f"报文解析失败: {str(e)}")
             
-            return {
+            failed_state = {
                 **state,
                 'parsing_status': 'failed',
                 'error_message': str(e),
                 'analysis_status': AnalysisStatus.FAILED
             }
+            mark_node_failed(failed_state, "message_parsing", str(e))
+            return failed_state
     
     async def _parse_file_fallback(self, file_path: str, filter_signals: List[str]) -> pd.DataFrame:
         """备用文件解析方法（用于非 BLF 格式）"""
@@ -337,6 +435,7 @@ class FlowControlModelNode:
         """处理流程控制模型分析"""
         df = state.get('parsed_data')
         stats = state.get('data_stats')
+        mark_node_started(state, "flow_control", "流程控制模型分析")
         
         if df is None or stats is None:
             raise ValueError("缺少解析数据")
@@ -357,21 +456,25 @@ class FlowControlModelNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("流程分析", 60, "流程分析完成")
             
-            return {
+            result_state = {
                 **state,
                 'flow_analysis': analysis_result,
                 'problem_direction': analysis_result.get('problem_direction', 'general_analysis'),
                 'confidence_score': analysis_result.get('confidence', 0.0)
             }
+            mark_node_completed(result_state, "flow_control", analysis_result)
+            return result_state
             
         except Exception as e:
             logger.error(f"流程控制模型分析失败: {str(e)}")
-            return {
+            failed_state = {
                 **state,
                 'problem_direction': 'general_analysis',
                 'confidence_score': 0.5,
                 'error_message': str(e)
             }
+            mark_node_failed(failed_state, "flow_control", str(e))
+            return failed_state
     
     def _build_prompt(self, stats: Dict[str, Any]) -> str:
         """构建提示，基于实际解析的信号"""
@@ -448,6 +551,7 @@ class RAGRetrievalNode:
         """处理RAG检索"""
         problem_direction = state.get('problem_direction', '')
         df = state.get('parsed_data')
+        mark_node_started(state, "rag_retrieval", "检索知识库")
         
         try:
             if state.get('progress_callback'):
@@ -465,20 +569,27 @@ class RAGRetrievalNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("知识检索", 80, "知识检索完成")
             
-            return {
+            result_state = {
                 **state,
                 'retrieved_documents': documents,
                 'retrieval_context': context,
                 'retrieval_status': 'completed'
             }
+            mark_node_completed(result_state, "rag_retrieval", {
+                "document_count": len(documents),
+                "query": query
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"RAG检索失败: {str(e)}")
-            return {
+            failed_state = {
                 **state,
                 'retrieval_status': 'failed',
                 'error_message': str(e)
             }
+            mark_node_failed(failed_state, "rag_retrieval", str(e))
+            return failed_state
     
     def _build_retrieval_query(self, problem_direction: str, df: pd.DataFrame) -> str:
         """构建检索查询，基于实际数据特征"""
@@ -542,16 +653,22 @@ class DetailedAnalysisNode:
         context = state.get('retrieval_context', '')
         df = state.get('parsed_data')
         iteration = state.get('iteration', 0)
+        mark_node_started(state, "detailed_analysis", f"细化分析第{iteration + 1}次", {"iteration": iteration})
         
         if iteration >= self.max_iterations:
             if state.get('progress_callback'):
                 await state['progress_callback']("细化分析", 85, "达到最大迭代次数")
             
-            return {
+            capped_state = {
                 **state,
                 'analysis_status': AnalysisStatus.MAX_ITERATIONS,
                 'iteration': iteration
             }
+            mark_node_completed(capped_state, "detailed_analysis", {
+                "iteration": iteration,
+                "status": "max_iterations"
+            })
+            return capped_state
         
         try:
             if state.get('progress_callback'):
@@ -567,31 +684,48 @@ class DetailedAnalysisNode:
             
             # 如果验证失败，尝试下一个迭代
             if not signal_validation['validated']:
-                return {
+                pending_state = {
                     **state,
                     'iteration': iteration + 1,
                     'refined_signals': refined_signals,
                     'signal_validation': signal_validation,
                     'next_step': 'flow_control_retry'
                 }
+                entry = _ensure_trace_entry(pending_state, "detailed_analysis")
+                entry["status"] = "running"
+                entry["output"] = {
+                    "validated": False,
+                    "iteration": iteration + 1,
+                    "signal_count": signal_validation.get('signal_count'),
+                    "average_quality": signal_validation.get('average_quality'),
+                }
+                return pending_state
             
             if state.get('progress_callback'):
                 await state['progress_callback']("细化分析", 90, "细化分析验证通过")
             
-            return {
+            result_state = {
                 **state,
                 'refined_signals': refined_signals,
                 'signal_validation': signal_validation,
                 'analysis_status': AnalysisStatus.COMPLETED
             }
+            mark_node_completed(result_state, "detailed_analysis", {
+                "validated": True,
+                "signal_count": signal_validation.get('signal_count'),
+                "average_quality": signal_validation.get('average_quality')
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"细化分析失败: {str(e)}")
-            return {
+            failed_state = {
                 **state,
                 'analysis_status': AnalysisStatus.VALIDATION_FAILED,
                 'error_message': str(e)
             }
+            mark_node_failed(failed_state, "detailed_analysis", str(e))
+            return failed_state
     
     async def _extract_refined_signals(self, direction: str, context: str, df: pd.DataFrame) -> List[str]:
         """提取细化信号，基于实际数据列和问题方向"""
@@ -684,6 +818,7 @@ class LLMAnalysisNode:
         data_stats = state.get('data_stats', {})
         refined_signals = state.get('refined_signals', [])
         validation = state.get('signal_validation', {})
+        mark_node_started(state, "llm_analysis", "生成诊断结论")
         
         try:
             if state.get('progress_callback'):
@@ -700,15 +835,20 @@ class LLMAnalysisNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("LLM分析", 100, "分析报告生成完成")
             
-            return {
+            result_state = {
                 **state,
                 'llm_analysis': analysis_result,
                 'analysis_status': AnalysisStatus.COMPLETED
             }
+            mark_node_completed(result_state, "llm_analysis", {
+                "summary": analysis_result.get("summary"),
+                "risk": analysis_result.get("risk_assessment")
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"LLM分析失败: {str(e)}")
-            return {
+            failed_state = {
                 **state,
                 'llm_analysis': {
                     "summary": "分析过程中发生错误",
@@ -719,6 +859,8 @@ class LLMAnalysisNode:
                 },
                 'error_message': str(e)
             }
+            mark_node_failed(failed_state, "llm_analysis", str(e))
+            return failed_state
     
     def _build_analysis_prompt(self, direction: str, context: str, stats: Dict, 
                               signals: List[str], validation: Dict) -> str:
@@ -813,6 +955,7 @@ class ReportGenerationNode:
             'refined_signals': state.get('refined_signals', []),
             'validation': state.get('signal_validation')
         }
+        mark_node_started(state, "report_generation", "生成可视化与报告")
         
         try:
             # 生成报告
@@ -821,17 +964,22 @@ class ReportGenerationNode:
             # 生成可视化数据
             visualizations = await self._generate_visualizations(state)
             
-            return {
+            result_state = {
                 **state,
                 'final_report': report,
                 'visualizations': visualizations,
                 'analysis_status': AnalysisStatus.COMPLETED,
                 'end_time': datetime.now()
             }
+            mark_node_completed(result_state, "report_generation", {
+                "visualization_count": len(visualizations),
+                "has_summary": bool(report.get('summary'))
+            })
+            return result_state
             
         except Exception as e:
             logger.error(f"报告生成失败: {str(e)}")
-            return {
+            failed_state = {
                 **state,
                 'final_report': {
                     'html_content': '报告生成失败',
@@ -842,6 +990,8 @@ class ReportGenerationNode:
                 'error_message': str(e),
                 'analysis_status': AnalysisStatus.FAILED
             }
+            mark_node_failed(failed_state, "report_generation", str(e))
+            return failed_state
     
     async def _generate_report(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """生成报告"""
@@ -979,6 +1129,8 @@ class ChargingAnalysisWorkflow:
             initial_state.setdefault('iteration', 0)
             initial_state.setdefault('start_time', datetime.now())
             initial_state.setdefault('analysis_status', AnalysisStatus.PENDING)
+            initial_state.setdefault('workflow_trace', {})
+            initial_state.setdefault('parsed_data_records', None)
             
             logger.info(f"开始执行充电分析工作流: {initial_state['analysis_id']}")
             
