@@ -1,8 +1,8 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
-import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Select, Spin, Card, Space, Typography, Progress } from 'antd';
+import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
-import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined } from '@ant-design/icons';
+import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import { useAuthStore } from './stores/authStore';
 import './styles/globals.css';
 
@@ -465,6 +465,61 @@ const ChargingPage = () => {
   const [analysisData, setAnalysisData] = React.useState<any>(null);
   const { user, token } = useAuthStore();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const workflowTrace = analysisData?.workflow_trace || {};
+
+  const formatDateTime = (value?: string) => {
+    if (!value) return '--';
+    try {
+      return new Date(value).toLocaleString('zh-CN');
+    } catch (error) {
+      return value;
+    }
+  };
+
+  const renderTraceInfo = (trace?: any) => {
+    if (!trace) return null;
+    const statusMap: Record<string, { label: string; color: string }> = {
+      completed: { label: '已完成', color: '#52c41a' },
+      running: { label: '进行中', color: '#2c5aa0' },
+      failed: { label: '失败', color: '#ff4d4f' },
+      pending: { label: '未开始', color: '#8c8c8c' },
+    };
+    const status = statusMap[trace.status] || statusMap.pending;
+    return (
+      <div style={{ marginBottom: '16px', padding: '12px', background: '#fafafa', borderRadius: '6px', border: '1px solid #f0f0f0' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '12px' }}>
+          <Tag color={status.color} style={{ marginRight: 0 }}>{status.label}</Tag>
+          {trace.started_at && (
+            <Typography.Text type="secondary">
+              开始：{formatDateTime(trace.started_at)}
+            </Typography.Text>
+          )}
+          {trace.ended_at && (
+            <Typography.Text type="secondary">
+              结束：{formatDateTime(trace.ended_at)}
+            </Typography.Text>
+          )}
+        </div>
+        {trace.description && (
+          <Typography.Text style={{ display: 'block', marginTop: '8px', color: '#595959' }}>
+            {trace.description}
+          </Typography.Text>
+        )}
+      </div>
+    );
+  };
+
+  const getTraceStatus = (stepId: string): 'pending' | 'active' | 'completed' | 'failed' | null => {
+    const trace = workflowTrace?.[stepId];
+    if (!trace) return null;
+    if (trace.status === 'completed') return 'completed';
+    if (trace.status === 'failed') return 'failed';
+    if (trace.status === 'running') return 'active';
+    if (trace.status === 'pending') return 'pending';
+    return null;
+  };
+
+  const getTraceEntry = (stepId: string) => workflowTrace?.[stepId];
 
   // 定义流程节点
   const workflowSteps = [
@@ -483,6 +538,7 @@ const ChargingPage = () => {
     if (!file) return [];
     
     const steps: any[] = [];
+    const hasTrace = analysisData && Object.keys(workflowTrace || {}).length > 0;
     
     // 文件上传步骤（始终显示）
     steps.push({
@@ -493,14 +549,24 @@ const ChargingPage = () => {
 
     // 如果已上传，显示文件验证
     if (status === 'uploaded' || status === 'analyzing' || status === 'completed') {
+      const validationStatus = getTraceStatus('file_validation');
       steps.push({
         ...workflowSteps[1],
-        status: status === 'uploaded' ? 'completed' : 'completed'
+        status: validationStatus || (status === 'uploaded' ? 'completed' : status === 'analyzing' ? 'active' : 'pending')
       });
     }
 
     // 根据进度显示其他步骤
-    if (status === 'analyzing' || status === 'completed') {
+    if (hasTrace) {
+      for (let i = 2; i < workflowSteps.length; i++) {
+        const step = workflowSteps[i];
+        const traceStatus = getTraceStatus(step.id) || 'pending';
+        steps.push({
+          ...step,
+          status: traceStatus
+        });
+      }
+    } else if (status === 'analyzing' || status === 'completed') {
       const currentProgress = analysisProgress;
       
       for (let i = 2; i < workflowSteps.length; i++) {
@@ -555,12 +621,17 @@ const ChargingPage = () => {
         data: {
           fileName: file?.name,
           fileSize: file?.size ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : '',
-          fileType: file?.name.split('.').pop()?.toUpperCase()
+          fileType: file?.name.split('.').pop()?.toUpperCase(),
+          trace: workflowTrace?.file_upload
         }
       },
       file_validation: {
         title: '文件验证',
-        data: analysisData.analysis_status || {}
+        data: {
+          validationStatus: analysisData?.validation_status,
+          validationMessage: analysisData?.validation_message,
+          trace: workflowTrace?.file_validation
+        }
       },
       message_parsing: {
         title: '报文解析',
@@ -569,30 +640,40 @@ const ChargingPage = () => {
           signalCount: analysisData.data_stats.signal_count || 0,
           totalRecords: analysisData.data_stats.total_records || 0,
           signalStats: analysisData.data_stats.signal_stats || {},
-          timeRange: analysisData.data_stats.time_range || {}
+          timeRange: analysisData.data_stats.time_range || {},
+          parsedRecords: analysisData.parsed_data || [],
+          trace: workflowTrace?.message_parsing
         } : {}
       },
       flow_control: {
         title: '流程控制',
-        data: analysisData.flow_analysis || {}
+        data: {
+          ...(analysisData.flow_analysis || {}),
+          trace: workflowTrace?.flow_control
+        }
       },
       rag_retrieval: {
         title: 'RAG检索',
         data: {
           retrievedDocuments: analysisData.retrieved_documents || [],
-          retrievalContext: analysisData.retrieval_context || ''
+          retrievalContext: analysisData.retrieval_context || '',
+          trace: workflowTrace?.rag_retrieval
         }
       },
       detailed_analysis: {
         title: '细化分析',
         data: {
           refinedSignals: analysisData.refined_signals || [],
-          signalValidation: analysisData.signal_validation || {}
+          signalValidation: analysisData.signal_validation || {},
+          trace: workflowTrace?.detailed_analysis
         }
       },
       llm_analysis: {
         title: 'LLM分析',
-        data: analysisData.llm_analysis || {}
+        data: {
+          ...(analysisData.llm_analysis || {}),
+          trace: workflowTrace?.llm_analysis
+        }
       },
       report_generation: {
         title: '报告生成',
@@ -600,7 +681,8 @@ const ChargingPage = () => {
           finalReport: analysisData.final_report || {},
           visualizations: analysisData.visualizations || [],
           llmAnalysis: analysisData.llm_analysis || {},
-          results: results || []
+          results: results || [],
+          trace: workflowTrace?.report_generation
         }
       }
     };
@@ -1320,6 +1402,7 @@ const ChargingPage = () => {
               const StepIcon = step.icon;
               const isActive = step.status === 'active';
               const isCompleted = step.status === 'completed';
+              const isFailed = step.status === 'failed';
               const isSelected = selectedStep === step.id;
               
               return (
@@ -1328,7 +1411,7 @@ const ChargingPage = () => {
                   <div style={{
                     width: '24px',
                     height: '2px',
-                    background: isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8',
+                    background: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8',
                     transition: 'all 0.3s',
                     flexShrink: 0
                   }} />
@@ -1339,8 +1422,8 @@ const ChargingPage = () => {
                     alignItems: 'center',
                     gap: '8px',
                     padding: '12px 16px',
-                    background: isSelected ? '#e6f7ff' : 'white',
-                    border: `2px solid ${isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8'}`,
+                    background: isFailed ? '#fff1f0' : isSelected ? '#e6f7ff' : 'white',
+                    border: `2px solid ${isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8'}`,
                     borderRadius: '8px',
                     boxShadow: isSelected ? '0 4px 12px rgba(44, 90, 160, 0.15)' : '0 2px 8px rgba(0,0,0,0.08)',
                     cursor: 'pointer',
@@ -1364,11 +1447,11 @@ const ChargingPage = () => {
                   >
                     <StepIcon style={{ 
                       fontSize: '20px', 
-                      color: isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c'
+                      color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c'
                     }} />
                     <span style={{ 
                       fontSize: '14px', 
-                      color: isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c',
+                      color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c',
                       fontWeight: isActive ? '500' : '400',
                       whiteSpace: 'nowrap'
                     }}>
@@ -1378,6 +1461,17 @@ const ChargingPage = () => {
                       <CheckCircleOutlined style={{ 
                         fontSize: '16px', 
                         color: '#52c41a',
+                        position: 'absolute',
+                        top: '-6px',
+                        right: '-6px',
+                        background: 'white',
+                        borderRadius: '50%'
+                      }} />
+                    )}
+                    {isFailed && (
+                      <CloseCircleOutlined style={{
+                        fontSize: '16px',
+                        color: '#ff4d4f',
                         position: 'absolute',
                         top: '-6px',
                         right: '-6px',
@@ -1492,6 +1586,7 @@ const ChargingPage = () => {
                 case 'file_upload':
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       <div style={{ marginBottom: '16px' }}>
                         <Typography.Text strong>文件名：</Typography.Text>
                         <Typography.Text>{details.data.fileName}</Typography.Text>
@@ -1507,6 +1602,34 @@ const ChargingPage = () => {
                     </div>
                   );
                 
+                case 'file_validation': {
+                  const validationStatus = details.data.validationStatus;
+                  const statusLabel = validationStatus === 'passed' ? '通过' :
+                    validationStatus === 'failed' ? '失败' :
+                    validationStatus ? validationStatus : '未知';
+                  const statusColor = validationStatus === 'passed' ? '#52c41a' :
+                    validationStatus === 'failed' ? '#ff4d4f' : '#8c8c8c';
+                  return (
+                    <div>
+                      {renderTraceInfo(details.data.trace)}
+                      <div style={{ marginBottom: '16px' }}>
+                        <Typography.Text strong>验证结果：</Typography.Text>
+                        <Typography.Text style={{ color: statusColor, marginLeft: '8px' }}>
+                          {statusLabel}
+                        </Typography.Text>
+                      </div>
+                      {details.data.validationMessage && (
+                        <div>
+                          <Typography.Text strong>说明：</Typography.Text>
+                          <Typography.Text style={{ marginLeft: '8px' }}>
+                            {details.data.validationMessage}
+                          </Typography.Text>
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+                
                 case 'message_parsing':
                   // 检查数据是否存在
                   if (!details.data || !details.data.dataStats) {
@@ -1520,8 +1643,20 @@ const ChargingPage = () => {
                   const dataStats = details.data.dataStats;
                   const signalStats = details.data.signalStats || dataStats.signal_stats || {};
                   const timeRange = details.data.timeRange || dataStats.time_range || {};
-                  
-                  return (
+                  const parsedRecords = details.data.parsedRecords || [];
+                  const parsedColumns = parsedRecords.length > 0
+                    ? Object.keys(parsedRecords[0]).map((key) => ({
+                        title: key,
+                        dataIndex: key,
+                        key
+                      }))
+                    : [];
+                  const parsedTableData = parsedRecords.map((row: any, index: number) => ({
+                    key: index,
+                    ...row
+                  }));
+
+                  const overviewContent = (
                     <div>
                       <div style={{ marginBottom: '20px' }}>
                         <Typography.Title level={5} style={{ marginBottom: '12px' }}>数据概览</Typography.Title>
@@ -1621,10 +1756,38 @@ const ChargingPage = () => {
                       )}
                     </div>
                   );
+
+                  const rawDataContent = parsedRecords.length > 0 ? (
+                    <Table
+                      size="small"
+                      columns={parsedColumns}
+                      dataSource={parsedTableData}
+                      pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'] }}
+                      scroll={{ x: 'max-content', y: 420 }}
+                    />
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '40px', color: '#8c8c8c' }}>
+                      暂无解析数据
+                    </div>
+                  );
+                  
+                  return (
+                    <div>
+                      {renderTraceInfo(details.data.trace)}
+                      <Tabs
+                        defaultActiveKey="overview"
+                        items={[
+                          { key: 'overview', label: '数据概览', children: overviewContent },
+                          { key: 'raw', label: parsedRecords.length ? `解析数据（${parsedRecords.length} 行）` : '解析数据', children: rawDataContent }
+                        ]}
+                      />
+                    </div>
+                  );
                 
                 case 'flow_control':
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       <div style={{ marginBottom: '16px' }}>
                         <Typography.Text strong>问题方向：</Typography.Text>
                         <Typography.Text>{details.data.problem_direction || '未确定'}</Typography.Text>
@@ -1645,6 +1808,7 @@ const ChargingPage = () => {
                 case 'rag_retrieval':
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       <div style={{ marginBottom: '16px' }}>
                         <Typography.Text strong>检索到文档数：</Typography.Text>
                         <Typography.Text>{details.data.retrievedDocuments?.length || 0}</Typography.Text>
@@ -1677,6 +1841,7 @@ const ChargingPage = () => {
                 case 'detailed_analysis':
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       <div style={{ marginBottom: '16px' }}>
                         <Typography.Text strong>细化信号数：</Typography.Text>
                         <Typography.Text>{details.data.refinedSignals?.length || 0}</Typography.Text>
@@ -1725,6 +1890,7 @@ const ChargingPage = () => {
                 case 'llm_analysis':
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       {details.data.summary && (
                         <div style={{ marginBottom: '16px' }}>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>诊断总结：</Typography.Text>
@@ -1792,6 +1958,7 @@ const ChargingPage = () => {
                   
                   return (
                     <div>
+                      {renderTraceInfo(details.data.trace)}
                       {/* LLM 分析总结 */}
                       {llmData.summary && (
                         <div style={{ marginBottom: '24px', padding: '20px', background: '#f0f4f8', borderRadius: '8px', borderLeft: '4px solid #2c5aa0' }}>

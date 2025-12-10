@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from database import session_scope
-from langgraph_workflow import ChargingAnalysisWorkflow, AnalysisStatus as WorkflowStatus
+from langgraph_workflow import (
+    ChargingAnalysisWorkflow,
+    AnalysisStatus as WorkflowStatus,
+    create_initial_workflow_trace,
+)
 from models import AnalysisResult, AnalysisStatus, ChargingAnalysis
 
 logger = logging.getLogger(__name__)
@@ -121,6 +125,7 @@ class AnalysisService:
         file_path_str: str | None = None
         file_size: int | None = None
         user_id: int | None = None
+        created_at: datetime | None = None
         
         with session_scope() as session:
             analysis: ChargingAnalysis | None = session.get(ChargingAnalysis, analysis_id)
@@ -131,6 +136,7 @@ class AnalysisService:
             file_path_str = analysis.file_path
             file_size = analysis.file_size
             user_id = analysis.user_id
+            created_at = analysis.created_at
 
             analysis.status = AnalysisStatus.PROCESSING
             analysis.progress = 5.0
@@ -141,6 +147,7 @@ class AnalysisService:
         # 在会话外使用已提取的值
         file_path = Path(file_path_str)
         progress_callback = self._progress_callback_factory(analysis_id)
+        workflow_trace = create_initial_workflow_trace(file_path.name, file_size or 0, created_at)
 
         return {
             "analysis_id": str(analysis_id),
@@ -155,6 +162,8 @@ class AnalysisService:
             "progress_callback": progress_callback,
             "start_time": datetime.utcnow(),
             "selected_signals": signal_names,  # 添加用户选择的信号列表
+            "workflow_trace": workflow_trace,
+            "parsed_data_records": None,
         }
 
     def _progress_callback_factory(self, analysis_id: int):
@@ -342,13 +351,18 @@ class AnalysisService:
 
         payload = {
             "analysis_status": _serialize(state.get("analysis_status")),
+            "validation_status": _serialize(state.get("validation_status")),
+            "validation_message": _serialize(state.get("validation_message")),
+            "parsing_status": _serialize(state.get("parsing_status")),
             "flow_analysis": _serialize(state.get("flow_analysis")),
             "llm_analysis": _serialize(state.get("llm_analysis")),
             "data_stats": _serialize(state.get("data_stats")),
+            "parsed_data": _serialize(state.get("parsed_data_records")),
             "retrieved_documents": _serialize(state.get("retrieved_documents")),
             "final_report": _serialize(state.get("final_report")),
             "refined_signals": _serialize(state.get("refined_signals")),
             "signal_validation": _serialize(state.get("signal_validation")),
+            "workflow_trace": _serialize(state.get("workflow_trace")),
             "timestamps": {
                 "start": _serialize(state.get("start_time")),
                 "end": _serialize(state.get("end_time")),
