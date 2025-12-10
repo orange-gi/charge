@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any, Dict
 
@@ -304,6 +305,11 @@ class AnalysisService:
             # 处理 WorkflowStatus
             if isinstance(obj, WorkflowStatus):
                 return obj.value
+
+            # 处理普通 float 的 NaN/Inf
+            if isinstance(obj, float):
+                if math.isnan(obj) or math.isinf(obj):
+                    return None
             
             # 处理 numpy 类型
             try:
