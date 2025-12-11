@@ -5,6 +5,7 @@ import zhCN from 'antd/locale/zh_CN';
 import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import { useAuthStore } from './stores/authStore';
 import './styles/globals.css';
+import TrainingCenter from './pages/training/TrainingCenter';
 
 const { Header, Content, Sider } = AntLayout;
 
@@ -210,7 +211,7 @@ const Dashboard = () => {
           {selectedKey === 'home' && <HomePage />}
           {selectedKey === 'charging' && <ChargingPage />}
           {selectedKey === 'rag' && <RAGPage />}
-          {selectedKey === 'training' && <TrainingPage />}
+          {selectedKey === 'training' && <TrainingCenter />}
         </Content>
     </AntLayout>
   );
@@ -2627,188 +2628,6 @@ const RAGPage = () => {
             )}
           </div>
         </div>
-      </div>
-    </div>
-  );
-};
-
-const TrainingPage = () => {
-  const [datasetFile, setDatasetFile] = React.useState<File | null>(null);
-  const [datasetName, setDatasetName] = React.useState('');
-  const [uploadStatus, setUploadStatus] = React.useState<string>('idle');
-  const [datasetId, setDatasetId] = React.useState<number | null>(null);
-  const [taskName, setTaskName] = React.useState('');
-  const [taskStatus, setTaskStatus] = React.useState<string>('idle');
-  const { user, token } = useAuthStore();
-  const fileInputRef = React.useRef<HTMLInputElement>(null);
-
-  const handleDatasetUpload = async () => {
-    if (!datasetFile || !datasetName || !user || !token) return;
-
-    setUploadStatus('uploading');
-    try {
-      const { trainingService } = await import('./services/trainingService');
-      
-      message.loading('上传数据集...', 0);
-      const dataset = await trainingService.uploadDataset(
-        datasetName,
-        datasetFile,
-        token,
-        {
-          description: '训练数据集',
-          datasetType: 'standard'
-        }
-      );
-      message.destroy();
-      message.success('数据集上传成功');
-      
-      setDatasetId(dataset.id);
-      setUploadStatus('uploaded');
-      
-    } catch (error: any) {
-      message.destroy();
-      message.error(error.message || '上传失败');
-      setUploadStatus('error');
-    }
-  };
-
-  const handleCreateTask = async () => {
-    if (!taskName || !datasetId || !user || !token) return;
-
-    setTaskStatus('creating');
-    try {
-      const { trainingService } = await import('./services/trainingService');
-      
-      message.loading('创建训练任务...', 0);
-      const task = await trainingService.createTrainingTask(
-        taskName,
-        datasetId,
-        'flow_control',
-        { epochs: 10, batch_size: 32, learning_rate: 0.001 },
-        token,
-        '流程控制模型训练'
-      );
-      message.destroy();
-      message.success('训练任务创建成功');
-      
-      // Start training
-      message.loading('启动训练...', 0);
-      await trainingService.startTraining(task.id, token);
-      message.destroy();
-      message.success('训练已启动');
-      
-      setTaskStatus('training');
-      
-      // Poll training status
-      pollTrainingStatus(task.id);
-      
-    } catch (error: any) {
-      message.destroy();
-      message.error(error.message || '创建任务失败');
-      setTaskStatus('error');
-    }
-  };
-
-  const pollTrainingStatus = async (taskId: number) => {
-    const authToken = useAuthStore.getState().token;
-    if (!authToken) return;
-    const { trainingService } = await import('./services/trainingService');
-    
-    const interval = setInterval(async () => {
-      try {
-        const task = await trainingService.getTrainingStatus(taskId, authToken);
-        
-        if (task.status === 'completed') {
-          clearInterval(interval);
-          setTaskStatus('completed');
-          message.success('训练完成');
-        } else if (task.status === 'failed') {
-          clearInterval(interval);
-          setTaskStatus('failed');
-          message.error('训练失败：' + ((task as any).error_message || '未知错误'));
-        }
-      } catch (error) {
-        console.error('轮询训练状态失败：', error);
-      }
-    }, 5000);
-    
-    // Stop after 30 minutes
-    setTimeout(() => clearInterval(interval), 1800000);
-  };
-
-  return (
-    <div>
-      <h1>训练管理</h1>
-      
-      <div style={{ marginTop: '24px' }}>
-        <h3>1. 上传训练数据集</h3>
-        <div style={{ marginTop: '16px', padding: '24px', border: '1px dashed #d9d9d9', borderRadius: '8px' }}>
-          <input
-            type="text"
-            placeholder="数据集名称"
-            value={datasetName}
-            onChange={(e) => setDatasetName(e.target.value)}
-            style={{ width: '100%', padding: '10px', border: '1px solid #d9d9d9', borderRadius: '4px', marginBottom: '16px' }}
-          />
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv,.xlsx"
-            onChange={(e) => e.target.files && setDatasetFile(e.target.files[0])}
-            style={{ display: 'none' }}
-          />
-          <Button onClick={() => fileInputRef.current?.click()}>
-            选择数据集文件
-          </Button>
-          {datasetFile && (
-            <div style={{ marginTop: '16px' }}>
-              <p>已选择：{datasetFile.name}</p>
-              <Button type="primary" onClick={handleDatasetUpload} disabled={!datasetName} style={{ marginTop: '12px' }}>
-                上传数据集
-              </Button>
-            </div>
-          )}
-          {uploadStatus !== 'idle' && (
-            <div style={{ marginTop: '16px', padding: '12px', background: '#f5f5f5', borderRadius: '4px' }}>
-              <p><strong>状态：</strong>{uploadStatus}</p>
-              {datasetId && <p><strong>数据集ID：</strong>{datasetId}</p>}
-            </div>
-          )}
-        </div>
-      </div>
-
-      {datasetId && (
-        <div style={{ marginTop: '32px' }}>
-          <h3>2. 创建训练任务</h3>
-          <div style={{ marginTop: '16px', padding: '24px', border: '1px dashed #d9d9d9', borderRadius: '8px' }}>
-            <input
-              type="text"
-              placeholder="任务名称"
-              value={taskName}
-              onChange={(e) => setTaskName(e.target.value)}
-              style={{ width: '100%', padding: '10px', border: '1px solid #d9d9d9', borderRadius: '4px', marginBottom: '16px' }}
-            />
-            <Button type="primary" onClick={handleCreateTask} disabled={!taskName}>
-              创建并启动训练
-            </Button>
-            {taskStatus !== 'idle' && (
-              <div style={{ marginTop: '16px', padding: '12px', background: '#f5f5f5', borderRadius: '4px' }}>
-                <p><strong>状态：</strong>{taskStatus}</p>
-                {taskStatus === 'training' && <p>训练进行中，请稍候...</p>}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-      
-      <div style={{ marginTop: '32px', padding: '16px', background: '#e6f7ff', borderRadius: '8px' }}>
-        <h4>功能说明：</h4>
-        <ul style={{ marginTop: '12px', lineHeight: '1.8' }}>
-          <li>上传CSV或Excel格式的训练数据集</li>
-          <li>创建训练任务并配置超参数</li>
-          <li>实时监控训练进度和指标</li>
-          <li>管理模型版本和评估结果</li>
-        </ul>
       </div>
     </div>
   );

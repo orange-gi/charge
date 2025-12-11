@@ -85,6 +85,8 @@ class User(Base):
     documents = relationship("KnowledgeDocument", back_populates="uploaded_by_user")
     training_datasets = relationship("TrainingDataset", back_populates="created_by_user")
     training_tasks = relationship("TrainingTask", back_populates="created_by_user")
+    training_configs = relationship("TrainingConfig", back_populates="created_by_user")
+    training_evaluations = relationship("TrainingEvaluation", back_populates="created_by_user")
     model_versions = relationship("ModelVersion", back_populates="created_by_user")
     system_logs = relationship("SystemLog", back_populates="user")
     audit_logs = relationship("AuditLog", back_populates="user")
@@ -232,6 +234,27 @@ class TrainingDataset(Base):
     training_tasks = relationship("TrainingTask", back_populates="dataset")
 
 
+class TrainingConfig(Base):
+    """训练配置预设模型"""
+    __tablename__ = "training_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    base_model = Column(String(100), nullable=False)
+    model_path = Column(String(500), nullable=False)
+    adapter_type = Column(String(50), default="lora", nullable=False)
+    model_size = Column(String(20), default="1.5b", nullable=False)
+    dataset_strategy = Column(String(50), default="full")
+    hyperparameters = Column(Text)  # JSON 数据
+    notes = Column(Text)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    created_by_user = relationship("User", back_populates="training_configs")
+    training_tasks = relationship("TrainingTask", back_populates="config")
+
+
 class ModelVersion(Base):
     """模型版本模型"""
     __tablename__ = "model_versions"
@@ -261,8 +284,11 @@ class TrainingTask(Base):
     name = Column(String(100), nullable=False)
     description = Column(Text)
     dataset_id = Column(Integer, ForeignKey("training_datasets.id", ondelete="SET NULL"))
+    config_id = Column(Integer, ForeignKey("training_configs.id", ondelete="SET NULL"))
     model_version_id = Column(Integer, ForeignKey("model_versions.id", ondelete="SET NULL"))
     model_type = Column(String(50), nullable=False)
+    adapter_type = Column(String(50), default="lora")
+    model_size = Column(String(20), default="1.5b")
     hyperparameters = Column(Text)  # JSON 数据
     status = Column(Enum(TrainingStatus), default=TrainingStatus.PENDING, nullable=False)
     progress = Column(Float, default=0.0)
@@ -285,8 +311,21 @@ class TrainingTask(Base):
     # 关系
     created_by_user = relationship("User", back_populates="training_tasks")
     dataset = relationship("TrainingDataset", back_populates="training_tasks")
+    config = relationship("TrainingConfig", back_populates="training_tasks")
     model_version = relationship("ModelVersion", back_populates="training_tasks")
     metrics_history = relationship("TrainingMetrics", back_populates="task", cascade="all, delete-orphan")
+    logs_history = relationship(
+        "TrainingLog",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TrainingLog.created_at",
+    )
+    evaluation = relationship(
+        "TrainingEvaluation",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class TrainingMetrics(Base):
@@ -306,6 +345,38 @@ class TrainingMetrics(Base):
     
     # 关系
     task = relationship("TrainingTask", back_populates="metrics_history")
+
+
+class TrainingLog(Base):
+    """训练日志记录"""
+    __tablename__ = "training_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("training_tasks.id", ondelete="CASCADE"), nullable=False)
+    log_level = Column(Enum(LogLevel), default=LogLevel.INFO, nullable=False)
+    message = Column(Text, nullable=False)
+    meta_info = Column(Text)  # JSON 数据
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    task = relationship("TrainingTask", back_populates="logs_history")
+
+
+class TrainingEvaluation(Base):
+    """训练评估记录"""
+    __tablename__ = "training_evaluations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("training_tasks.id", ondelete="CASCADE"), nullable=False)
+    evaluator = Column(String(100))
+    evaluation_type = Column(String(50), default="automatic")
+    metrics = Column(Text)  # JSON 数据
+    recommended_plan = Column(String(100))
+    notes = Column(Text)
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    task = relationship("TrainingTask", back_populates="evaluation")
+    created_by_user = relationship("User", back_populates="training_evaluations")
 
 
 class SystemLog(Base):
