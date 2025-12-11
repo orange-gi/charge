@@ -134,21 +134,24 @@ const Dashboard = () => {
 
   return (
     <AntLayout style={{ minHeight: '100vh' }}>
-      <Header style={{ 
-        background: '#fff', 
-        borderBottom: '1px solid #e8e8e8',
-        display: 'flex', 
-        alignItems: 'center', 
-        justifyContent: 'space-between', 
-        padding: '0 24px',
-        height: '64px',
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        right: 0,
-        zIndex: 1000,
-        boxShadow: '0 2px 8px rgba(0,0,0,0.06)'
-      }}>
+      <Header
+        style={{
+          background: 'rgba(255,255,255,0.92)',
+          backdropFilter: 'blur(6px)',
+          borderBottom: '1px solid #eef2f7',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '0 28px',
+          height: '68px',
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          zIndex: 1000,
+          boxShadow: '0 12px 30px rgba(15,23,42,0.08)'
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', gap: '32px', flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', gap: '8px', flex: 1, minWidth: 0 }}>
             <Button 

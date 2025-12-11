@@ -83,6 +83,62 @@ const TrainingCenter: React.FC = () => {
   const [evaluationForm] = Form.useForm();
   const [publishForm] = Form.useForm();
 
+  const handleDatasetFileChange = (file: File | null) => {
+    if (file) {
+      setDatasetFile(file);
+      if (!datasetName) {
+        const guessedName = file.name.replace(/\.[^/.]+$/, '');
+        setDatasetName(guessedName);
+      }
+    } else {
+      setDatasetFile(null);
+    }
+  };
+
+  const handleLoadConfig = (config: TrainingConfig) => {
+    configForm.setFieldsValue({
+      configId: config.id,
+      name: config.name,
+      baseModel: config.baseModel,
+      modelPath: config.modelPath,
+      modelSize: config.modelSize,
+      datasetStrategy: config.datasetStrategy,
+      hyperparameters: config.hyperparameters,
+      notes: config.notes
+    });
+    message.success(`已载入配置「${config.name}」`);
+  };
+
+  const handleTaskConfigChange = (configId?: number | null) => {
+    if (!configId) {
+      return;
+    }
+    const config = configs.find((item) => item.id === configId);
+    if (!config) {
+      return;
+    }
+    const hyper = (config.hyperparameters || {}) as Record<string, unknown>;
+    const pickNumber = (...keys: string[]) => {
+      for (const key of keys) {
+        const value = hyper[key];
+        if (typeof value === 'number') {
+          return value;
+        }
+        if (typeof value === 'string' && value.trim() !== '' && !Number.isNaN(Number(value))) {
+          return Number(value);
+        }
+      }
+      return undefined;
+    };
+    taskForm.setFieldsValue({
+      modelSize: config.modelSize,
+      epochs: pickNumber('epochs', 'Epochs') ?? taskForm.getFieldValue('epochs'),
+      batchSize: pickNumber('batch_size', 'batchSize', 'BatchSize') ?? taskForm.getFieldValue('batchSize'),
+      learningRate: pickNumber('learning_rate', 'learningRate', 'LearningRate') ?? taskForm.getFieldValue('learningRate')
+    });
+    message.success(`已根据「${config.name}」同步超参数`);
+  };
+
   const ensureToken = () => {
     if (!token) {
       message.warning('请先登录以使用训练功能');
@@ -401,21 +457,7 @@ const TrainingCenter: React.FC = () => {
               <List.Item
                 key={item.id}
                 actions={[
-                  <Button
-                    type="link"
-                    onClick={() =>
-                      configForm.setFieldsValue({
-                        configId: item.id,
-                        name: item.name,
-                        baseModel: item.baseModel,
-                        modelPath: item.modelPath,
-                        modelSize: item.modelSize,
-                        datasetStrategy: item.datasetStrategy,
-                        hyperparameters: item.hyperparameters,
-                        notes: item.notes
-                      })
-                    }
-                  >
+                  <Button type="link" onClick={() => handleLoadConfig(item)}>
                     载入
                   </Button>
                 ]}
@@ -450,9 +492,14 @@ const TrainingCenter: React.FC = () => {
           <input
             type="file"
             accept=".csv,.xlsx"
-            onChange={(e) => setDatasetFile(e.target.files?.[0] || null)}
+            onChange={(e) => handleDatasetFileChange(e.target.files?.[0] || null)}
           />
-          <Button type="primary" onClick={handleDatasetUpload} disabled={!datasetFile || !datasetName} loading={uploadingDataset}>
+          <Button
+            type="primary"
+            onClick={handleDatasetUpload}
+            disabled={!datasetFile || !datasetName}
+            loading={uploadingDataset}
+          >
             上传数据集
           </Button>
           {datasetInfo.id && (
@@ -487,6 +534,7 @@ const TrainingCenter: React.FC = () => {
               allowClear
               placeholder="选择训练配置"
               options={configs.map((cfg) => ({ value: cfg.id, label: `${cfg.name} (${cfg.modelSize.toUpperCase()})` }))}
+              onChange={(value) => handleTaskConfigChange(typeof value === 'number' ? value : null)}
             />
           </Form.Item>
           <Form.Item label="模型规模" name="modelSize" rules={[{ required: true }]}> 
