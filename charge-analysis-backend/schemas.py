@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -170,11 +170,34 @@ class DatasetCreateRequest(BaseModel):
     dataset_type: str = Field(default="standard")
 
 
+class TrainingConfigRequest(BaseModel):
+    name: str
+    base_model: str
+    model_path: str
+    adapter_type: Literal["lora"] = "lora"
+    model_size: Literal["1.5b", "7b"]
+    dataset_strategy: str = "full"
+    hyperparameters: dict[str, Any] | None = None
+    notes: Optional[str] = None
+
+
+class TrainingConfigResponse(TrainingConfigRequest):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class TrainingTaskCreateRequest(BaseModel):
     name: str
     description: Optional[str] = None
     dataset_id: int
+    config_id: Optional[int] = None
     model_type: str = Field(default="flow_control")
+    model_size: Literal["1.5b", "7b"] = "1.5b"
+    adapter_type: Literal["lora"] = "lora"
     hyperparameters: dict[str, Any] | None = None
 
 
@@ -183,6 +206,70 @@ class TrainingTaskResponse(BaseModel):
     name: str
     status: str
     progress: float
+    model_size: str
+    adapter_type: str
+    dataset_id: Optional[int]
+    config_id: Optional[int]
 
     class Config:
         from_attributes = True
+
+
+class TrainingTaskDetailResponse(TrainingTaskResponse):
+    current_epoch: Optional[int]
+    total_epochs: Optional[int]
+    metrics: Optional[dict[str, Any]]
+    created_at: datetime
+    updated_at: datetime
+
+
+class TrainingLogResponse(BaseModel):
+    id: int
+    log_level: str
+    message: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TrainingMetricPoint(BaseModel):
+    epoch: int
+    step: int
+    loss: Optional[float]
+    accuracy: Optional[float]
+    learning_rate: Optional[float]
+    gpu_memory: Optional[float]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TrainingEvaluationRequest(BaseModel):
+    evaluation_type: str = "automatic"
+    metrics: dict[str, Any]
+    recommended_plan: str
+    notes: Optional[str] = None
+
+
+class TrainingEvaluationResponse(TrainingEvaluationRequest):
+    id: int
+    task_id: int
+    evaluator: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ModelPublishRequest(BaseModel):
+    version: str
+    target_environment: str
+    endpoint_url: Optional[str] = None
+    notes: Optional[str] = None
+    set_default: bool = False
+
+
+class TrainingTaskListResponse(BaseModel):
+    items: list[TrainingTaskDetailResponse]
