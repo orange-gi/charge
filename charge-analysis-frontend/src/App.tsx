@@ -2298,6 +2298,8 @@ const RAGPage = () => {
   const [answer, setAnswer] = React.useState('');
   const [isQuerying, setIsQuerying] = React.useState(false);
   const [documents, setDocuments] = React.useState<any[]>([]);
+  const [resultDocs, setResultDocs] = React.useState<any[]>([]);
+  const [queryRuntime, setQueryRuntime] = React.useState<number | null>(null);
   const [uploadFile, setUploadFile] = React.useState<File | null>(null);
   const [queryHistory, setQueryHistory] = React.useState<any[]>([]);
   const { user, token } = useAuthStore();
@@ -2391,6 +2393,8 @@ const RAGPage = () => {
     }
 
     setIsQuerying(true);
+    setResultDocs([]);
+    setQueryRuntime(null);
     try {
       const { ragService } = await import('./services/ragService');
       
@@ -2398,6 +2402,8 @@ const RAGPage = () => {
       const response = await ragService.query(collectionId, query, token);
       
       setAnswer(response.response);
+      setResultDocs(response.documents || []);
+      setQueryRuntime(response.queryTime ?? null);
       message.success('查询完成');
       
       // Reload query history
@@ -2502,20 +2508,68 @@ const RAGPage = () => {
 
         {/* 查询结果 */}
         {answer && (
-          <div style={{ 
-            marginTop: '20px', 
-            padding: '20px', 
-            background: 'white', 
-            borderRadius: '8px',
-            border: '1px solid #e8e8e8'
-          }}>
-            <h4 style={{ marginBottom: '12px', color: '#1890ff' }}>查询结果</h4>
-            <div style={{ 
-              whiteSpace: 'pre-wrap', 
-              lineHeight: '1.8',
-              color: '#333'
-            }}>
-              {answer}
+          <div
+            style={{
+              marginTop: '20px',
+              padding: '20px',
+              background: 'white',
+              borderRadius: '8px',
+              border: '1px solid #e8e8e8',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '16px'
+            }}
+          >
+            <div>
+              <h4 style={{ marginBottom: '8px', color: '#1890ff' }}>查询结果</h4>
+              {queryRuntime !== null && (
+                <div style={{ fontSize: '12px', color: '#999', display: 'flex', gap: '16px' }}>
+                  <span>匹配文档：{resultDocs.length} 个</span>
+                  <span>耗时：{queryRuntime} ms</span>
+                </div>
+              )}
+              <div
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  lineHeight: '1.8',
+                  color: '#333',
+                  marginTop: '8px'
+                }}
+              >
+                {answer}
+              </div>
+            </div>
+
+            <div>
+              <h5 style={{ marginBottom: '8px', color: '#595959' }}>相关文档</h5>
+              {resultDocs.length === 0 ? (
+                <div style={{ padding: '12px', background: '#fafafa', borderRadius: '6px', color: '#999' }}>
+                  未找到匹配的文档片段
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {resultDocs.map((doc, index) => (
+                    <div
+                      key={doc.id ?? `${doc.filename ?? 'doc'}-${index}`}
+                      style={{
+                        border: '1px solid #f0f0f0',
+                        borderRadius: '6px',
+                        padding: '12px',
+                        background: '#fcfcfc'
+                      }}
+                    >
+                      <div style={{ fontWeight: 600, color: '#333' }}>{doc.filename || `文档片段 ${index + 1}`}</div>
+                      <div style={{ fontSize: '12px', color: '#999', marginTop: '4px', display: 'flex', gap: '12px' }}>
+                        {typeof doc.score === 'number' && <span>匹配度：{doc.score.toFixed(2)}</span>}
+                        {doc.id && <span>ID：{doc.id}</span>}
+                      </div>
+                      {doc.snippet && (
+                        <p style={{ marginTop: '8px', color: '#555', lineHeight: 1.6 }}>{doc.snippet}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
