@@ -1,7 +1,7 @@
 """知识库（RAG）API。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
 from io import BytesIO
 
 from core.dependencies import get_current_user
@@ -24,7 +24,10 @@ rag_service = get_rag_service()
 
 @router.post("/collections")
 def create_collection(
-    payload: RagCollectionCreate,
+    payload: RagCollectionCreate = Body(
+        ...,
+        example={"name": "充电协议FAQ", "description": "收录常见的国标充电问题解答"},
+    ),
     user: User = Depends(get_current_user),
 ) -> RagCollectionRead:
     collection = rag_service.create_collection(payload.name, payload.description, user.id)
@@ -130,7 +133,10 @@ def list_queries(
 
 @router.post("/query", response_model=RagQueryResponse)
 def query_knowledge(
-    payload: RagQueryRequest,
+    payload: RagQueryRequest = Body(
+        ...,
+        example={"collection_id": 12, "query": "直流桩电压波动超标如何处理？"},
+    ),
     user: User = Depends(get_current_user),
 ) -> RagQueryResponse:
     result = rag_service.query(payload.collection_id, payload.query, user.id)

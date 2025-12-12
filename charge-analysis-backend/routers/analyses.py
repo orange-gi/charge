@@ -5,7 +5,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from config import get_settings
@@ -119,7 +119,10 @@ def get_available_signals() -> AvailableSignalsResponse:
 @router.post("/{analysis_id}/run", response_model=AnalysisRunResponse)
 async def run_analysis(
     analysis_id: int,
-    request: AnalysisRunRequest,
+    request: AnalysisRunRequest = Body(
+        ...,
+        example={"signal_names": ["BatteryVoltage", "ChargeCurrent", "StateOfCharge"]},
+    ),
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
