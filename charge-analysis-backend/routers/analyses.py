@@ -119,13 +119,13 @@ def get_available_signals() -> AvailableSignalsResponse:
 @router.post("/{analysis_id}/run", response_model=AnalysisRunResponse)
 async def run_analysis(
     analysis_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
     request: AnalysisRunRequest = Body(
         ...,
         example={"signal_names": ["BatteryVoltage", "ChargeCurrent", "StateOfCharge"]},
     ),
-    background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ) -> AnalysisRunResponse:
     """运行分析，支持选择特定信号进行解析"""
     analysis = (
