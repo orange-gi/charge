@@ -13,7 +13,7 @@ from core.dependencies import get_current_user
 from core.security import compute_expiration, generate_session_token, hash_password, verify_password
 from database import get_db
 from models import User, UserRole, UserSession
-from schemas import AuthResponse, UserCreate, UserLogin, UserRead
+from schemas import AuthResponse, MessageResponse, UserCreate, UserLogin, UserRead
 
 logger = logging.getLogger(__name__)
 
@@ -141,11 +141,11 @@ def current_user(user: User = Depends(get_current_user)) -> UserRead:
     return UserRead.model_validate(user)
 
 
-@router.post("/logout")
+@router.post("/logout", response_model=MessageResponse)
 def logout(
     credentials: HTTPAuthorizationCredentials | None = Depends(http_bearer),
     db: Session = Depends(get_db),
-) -> dict:
+) -> MessageResponse:
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录")
 
@@ -154,4 +154,4 @@ def logout(
     if session:
         db.delete(session)
         db.commit()
-    return {"message": "已退出"}
+    return MessageResponse(message="已退出")

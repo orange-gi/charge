@@ -13,12 +13,15 @@ from core.dependencies import get_current_user
 from database import get_db
 from models import AnalysisResult, AnalysisStatus, ChargingAnalysis, User
 from schemas import (
-    AnalysisListResponse, 
-    AnalysisRead, 
+    AnalysisCancelResponse,
+    AnalysisListResponse,
+    AnalysisRead,
+    AnalysisResultRead,
+    AnalysisResultsResponse,
     AnalysisRunRequest,
     AnalysisRunResponse,
     AvailableSignalsResponse,
-    SignalInfo
+    SignalInfo,
 )
 from services.analysis_service import get_analysis_service
 
@@ -41,8 +44,8 @@ def list_analyses(user: User = Depends(get_current_user), db: Session = Depends(
 @router.post("/upload", response_model=AnalysisRead)
 async def upload_analysis(
     file: UploadFile = File(...),
-    analysis_name: str | None = Form(None),
-    description: str | None = Form(None),
+    analysis_name: str | None = Form(None, example="国标充电日志-2024Q4"),
+    description: str | None = Form(None, example="12月现场采集的DC桩充电过程"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> AnalysisRead:
@@ -119,13 +122,13 @@ def get_available_signals() -> AvailableSignalsResponse:
 @router.post("/{analysis_id}/run", response_model=AnalysisRunResponse)
 async def run_analysis(
     analysis_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
     request: AnalysisRunRequest = Body(
         ...,
         example={"signal_names": ["BatteryVoltage", "ChargeCurrent", "StateOfCharge"]},
     ),
-    background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ) -> AnalysisRunResponse:
     """运行分析，支持选择特定信号进行解析"""
     analysis = (
@@ -151,12 +154,12 @@ async def run_analysis(
     return AnalysisRunResponse(analysis_id=analysis_id, status="processing")
 
 
-@router.post("/{analysis_id}/cancel", response_model=dict)
+@router.post("/{analysis_id}/cancel", response_model=AnalysisCancelResponse)
 def cancel_analysis(
     analysis_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict:
+) -> AnalysisCancelResponse:
     """取消分析（总是成功）
     
     无论分析是否在运行中，都会成功返回：
@@ -175,11 +178,11 @@ def cancel_analysis(
     cancelled = analysis_service.cancel_analysis(analysis_id)
     
     # cancel_analysis 总是返回 True，所以这里总是成功
-    return {
-        "message": "分析已取消",
-        "analysis_id": analysis_id,
-        "was_running": analysis.status == AnalysisStatus.PROCESSING
-    }
+    return AnalysisCancelResponse(
+        message="分析已取消",
+        analysis_id=analysis_id,
+        was_running=analysis.status == AnalysisStatus.PROCESSING,
+    )
 
 
 @router.get("/{analysis_id}", response_model=AnalysisRead)
@@ -217,8 +220,10 @@ def delete_analysis(analysis_id: int, user: User = Depends(get_current_user), db
     return None
 
 
-@router.get("/{analysis_id}/results")
-def list_results(analysis_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+@router.get("/{analysis_id}/results", response_model=AnalysisResultsResponse)
+def list_results(
+    analysis_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> AnalysisResultsResponse:
     analysis = (
         db.query(ChargingAnalysis)
         .filter(ChargingAnalysis.id == analysis_id, ChargingAnalysis.user_id == user.id)
@@ -233,19 +238,7 @@ def list_results(analysis_id: int, user: User = Depends(get_current_user), db: S
         .order_by(AnalysisResult.created_at.asc())
         .all()
     )
-    return {
-        "analysis": AnalysisRead.model_validate(analysis),
-        "results": [
-            {
-                "id": r.id,
-                "analysis_id": r.analysis_id,
-                "result_type": r.result_type,
-                "title": r.title,
-                "content": r.content,
-                "meta_info": r.meta_info,
-                "confidence_score": r.confidence_score,
-                "created_at": r.created_at.isoformat(),
-            }
-            for r in results
-        ],
-    }
+    return AnalysisResultsResponse(
+        analysis=AnalysisRead.model_validate(analysis),
+        results=[AnalysisResultRead.model_validate(r) for r in results],
+    )
