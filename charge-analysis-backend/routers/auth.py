@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -27,7 +27,19 @@ def _build_auth_response(user: User, token: str) -> AuthResponse:
 
 
 @router.post("/register", response_model=AuthResponse)
-def register(payload: UserCreate, db: Session = Depends(get_db)) -> AuthResponse:
+def register(
+    payload: UserCreate = Body(
+        ...,
+        example={
+            "email": "engineer@example.com",
+            "password": "Charge#2024",
+            "username": "charger_admin",
+            "first_name": "Li",
+            "last_name": "Lei",
+        },
+    ),
+    db: Session = Depends(get_db),
+) -> AuthResponse:
     try:
         # 检查邮箱是否已存在
         if db.query(User).filter(User.email == payload.email).first():
@@ -102,7 +114,13 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> AuthResponse
 
 
 @router.post("/login", response_model=AuthResponse)
-def login(payload: UserLogin, db: Session = Depends(get_db)) -> AuthResponse:
+def login(
+    payload: UserLogin = Body(
+        ...,
+        example={"email": "engineer@example.com", "password": "Charge#2024"},
+    ),
+    db: Session = Depends(get_db),
+) -> AuthResponse:
     user: User | None = db.query(User).filter(User.email == payload.email).first()
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邮箱或密码错误")

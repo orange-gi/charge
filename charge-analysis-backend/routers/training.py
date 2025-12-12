@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Body,
     Depends,
     File,
     Form,
@@ -156,7 +157,19 @@ def list_training_configs(user: User = Depends(get_current_user), db: Session = 
 
 @router.post("/configs", response_model=TrainingConfigResponse)
 def create_training_config(
-    payload: TrainingConfigRequest,
+    payload: TrainingConfigRequest = Body(
+        ...,
+        example={
+            "name": "DC充电LoRA配置",
+            "base_model": "Qwen2-1.5B",
+            "model_path": "/models/qwen2",
+            "adapter_type": "lora",
+            "model_size": "1.5b",
+            "dataset_strategy": "full",
+            "hyperparameters": {"learning_rate": 0.0003, "batch_size": 4, "epochs": 5},
+            "notes": "适用于国标充电日志微调",
+        },
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -183,7 +196,19 @@ def create_training_config(
 @router.put("/configs/{config_id}", response_model=TrainingConfigResponse)
 def update_training_config(
     config_id: int,
-    payload: TrainingConfigRequest,
+    payload: TrainingConfigRequest = Body(
+        ...,
+        example={
+            "name": "DC充电LoRA配置-更新",
+            "base_model": "Qwen2-1.5B",
+            "model_path": "/models/qwen2-v2",
+            "adapter_type": "lora",
+            "model_size": "1.5b",
+            "dataset_strategy": "filtered",
+            "hyperparameters": {"learning_rate": 0.00025, "batch_size": 8, "epochs": 8},
+            "notes": "增加了异常案例样本",
+        },
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -215,7 +240,19 @@ def update_training_config(
 
 @router.post("/tasks", response_model=dict)
 def create_task(
-    payload: TrainingTaskCreateRequest,
+    payload: TrainingTaskCreateRequest = Body(
+        ...,
+        example={
+            "name": "国标异常诊断-批次1",
+            "description": "使用Dataset 3和Config 2训练直流桩诊断模型",
+            "dataset_id": 3,
+            "config_id": 2,
+            "model_type": "flow_control",
+            "model_size": "1.5b",
+            "adapter_type": "lora",
+            "hyperparameters": {"learning_rate": 0.0002, "epochs": 6, "batch_size": 8},
+        },
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -375,7 +412,15 @@ def get_task_metrics(
 @router.post("/tasks/{task_id}/evaluate", response_model=TrainingEvaluationResponse)
 def evaluate_task(
     task_id: int,
-    payload: TrainingEvaluationRequest,
+    payload: TrainingEvaluationRequest = Body(
+        ...,
+        example={
+            "evaluation_type": "automatic",
+            "metrics": {"accuracy": 0.91, "loss": 0.34, "latency_ms": 120},
+            "recommended_plan": "增加故障日志数据并降低学习率",
+            "notes": "桩A样本表现最佳",
+        },
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -432,7 +477,16 @@ def get_task_evaluation(
 @router.post("/tasks/{task_id}/publish")
 def publish_task_model(
     task_id: int,
-    payload: ModelPublishRequest,
+    payload: ModelPublishRequest = Body(
+        ...,
+        example={
+            "version": "v1.0.0",
+            "target_environment": "prod-shanghai",
+            "endpoint_url": "https://rag.example.com/models/dc-diagnosis",
+            "notes": "首个外部可用版本",
+            "set_default": True,
+        },
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
