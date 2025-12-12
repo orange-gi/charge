@@ -53,6 +53,11 @@ async def upload_document(
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
+    if b"\x00" in raw_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="文件包含不可处理的二进制内容，请提供纯文本文件",
+        )
 
     try:
         content = raw_bytes.decode("utf-8")
