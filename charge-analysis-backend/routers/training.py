@@ -34,7 +34,11 @@ from models import (
     User,
 )
 from schemas import (
+    DatasetUploadResponse,
     ModelPublishRequest,
+    ModelPublishResponse,
+    ModelVersionCreateResponse,
+    TaskStartResponse,
     TrainingConfigRequest,
     TrainingConfigResponse,
     TrainingEvaluationRequest,
@@ -42,6 +46,7 @@ from schemas import (
     TrainingLogResponse,
     TrainingMetricPoint,
     TrainingTaskCreateRequest,
+    TrainingTaskCreateResponse,
     TrainingTaskDetailResponse,
     TrainingTaskListResponse,
 )
@@ -101,15 +106,15 @@ def _task_to_response(task: TrainingTask) -> TrainingTaskDetailResponse:
     )
 
 
-@router.post("/datasets")
+@router.post("/datasets", response_model=DatasetUploadResponse)
 async def upload_dataset(
     file: UploadFile = File(...),
-    name: str = Form(...),
-    description: str | None = Form(None),
-    dataset_type: str = Form("standard"),
+    name: str = Form(..., example="直流桩异常样本-12月"),
+    description: str | None = Form(None, example="来自上海实验室的现场调试日志"),
+    dataset_type: str = Form("standard", example="standard"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-):
+) -> DatasetUploadResponse:
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
@@ -141,7 +146,7 @@ async def upload_dataset(
     db.add(dataset)
     db.commit()
     db.refresh(dataset)
-    return {"dataset_id": dataset.id, "sample_count": sample_count}
+    return DatasetUploadResponse(dataset_id=dataset.id, sample_count=sample_count)
 
 
 @router.get("/configs", response_model=list[TrainingConfigResponse])
@@ -238,7 +243,7 @@ def update_training_config(
     return _config_to_response(config)
 
 
-@router.post("/tasks", response_model=dict)
+@router.post("/tasks", response_model=TrainingTaskCreateResponse)
 def create_task(
     payload: TrainingTaskCreateRequest = Body(
         ...,
@@ -255,7 +260,7 @@ def create_task(
     ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> dict:
+) -> TrainingTaskCreateResponse:
     if payload.model_size not in {"1.5b", "7b"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前仅支持训练 1.5B 或 7B LoRA 模型")
     if payload.adapter_type.lower() != "lora":
@@ -306,7 +311,7 @@ def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
-    return {"task_id": task.id, "status": task.status.value}
+    return TrainingTaskCreateResponse(task_id=task.id, status=task.status.value)
 
 
 @router.get("/tasks", response_model=TrainingTaskListResponse)
@@ -320,13 +325,13 @@ def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get
     return {"items": [_task_to_response(task) for task in tasks]}
 
 
-@router.post("/tasks/{task_id}/start")
+@router.post("/tasks/{task_id}/start", response_model=TaskStartResponse)
 async def start_task(
     task_id: int,
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-):
+) -> TaskStartResponse:
     task = db.query(TrainingTask).filter(TrainingTask.id == task_id, TrainingTask.created_by == user.id).first()
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
@@ -339,7 +344,7 @@ async def start_task(
     db.commit()
 
     background_tasks.add_task(training_service.start_training, task_id)
-    return {"message": "训练已加入队列", "task_id": task_id}
+    return TaskStartResponse(message="训练已加入队列", task_id=task_id)
 
 
 @router.get("/tasks/{task_id}", response_model=TrainingTaskDetailResponse)
@@ -474,7 +479,7 @@ def get_task_evaluation(
     )
 
 
-@router.post("/tasks/{task_id}/publish")
+@router.post("/tasks/{task_id}/publish", response_model=ModelPublishResponse)
 def publish_task_model(
     task_id: int,
     payload: ModelPublishRequest = Body(
@@ -489,7 +494,7 @@ def publish_task_model(
     ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-):
+) -> ModelPublishResponse:
     task = db.query(TrainingTask).filter(TrainingTask.id == task_id, TrainingTask.created_by == user.id).first()
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
@@ -528,21 +533,21 @@ def publish_task_model(
     db.commit()
     db.refresh(model_version)
 
-    return {
-        "model_version_id": model_version.id,
-        "version": model_version.version,
-        "endpoint_url": payload.endpoint_url,
-    }
+    return ModelPublishResponse(
+        model_version_id=model_version.id,
+        version=model_version.version,
+        endpoint_url=payload.endpoint_url,
+    )
 
 
-@router.post("/models")
+@router.post("/models", response_model=ModelVersionCreateResponse)
 def create_model_version(
-    name: str = Form(...),
-    model_type: str = Form("flow_control"),
-    version: str = Form(...),
-    model_path: str = Form(...),
-    config: str | None = Form(None),
-    metrics: str | None = Form(None),
+    name: str = Form(..., example="DC诊断模型"),
+    model_type: str = Form("flow_control", example="flow_control"),
+    version: str = Form(..., example="v1.0.0"),
+    model_path: str = Form(..., example="/models/task_15_v1.bin"),
+    config: str | None = Form(None, example='{"target_environment":"prod-shanghai"}'),
+    metrics: str | None = Form(None, example='{"accuracy":0.92}'),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -558,4 +563,4 @@ def create_model_version(
     db.add(record)
     db.commit()
     db.refresh(record)
-    return {"model_version_id": record.id}
+    return ModelVersionCreateResponse(model_version_id=record.id)
