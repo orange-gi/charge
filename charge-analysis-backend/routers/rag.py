@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from io import BytesIO
 
 from core.dependencies import get_current_user
 from models import User, UserRole
@@ -13,6 +14,8 @@ from schemas import (
     RagQueryRequest,
     RagQueryResponse,
 )
+from PyPDF2 import PdfReader
+
 from services.rag_service import get_rag_service
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
@@ -53,11 +56,10 @@ async def upload_document(
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
-
     try:
-        content = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        content = raw_bytes.decode("utf-8", errors="ignore")
+        content = _extract_text_from_upload(file, raw_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     try:
         document = rag_service.add_document_from_text(
@@ -71,6 +73,33 @@ async def upload_document(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return KnowledgeDocumentRead.model_validate(document)
+
+
+def _extract_text_from_upload(file: UploadFile, raw_bytes: bytes) -> str:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+
+    if filename.endswith(".pdf") or content_type == "application/pdf":
+        try:
+            reader = PdfReader(BytesIO(raw_bytes))
+        except Exception as exc:  # PyPDF2 内部会抛出多种异常
+            raise ValueError("无法解析 PDF 文件") from exc
+        pages_text: list[str] = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text:
+                pages_text.append(text)
+        if not pages_text:
+            raise ValueError("PDF 中未提取到可用文本")
+        return "\n".join(pages_text)
+
+    if b"\x00" in raw_bytes:
+        raise ValueError("文件包含不可处理的二进制内容，请提供文本格式")
+
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw_bytes.decode("utf-8", errors="ignore")
 
 
 @router.get("/collections/{collection_id}/documents", response_model=list[KnowledgeDocumentRead])
