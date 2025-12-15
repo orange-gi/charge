@@ -68,6 +68,27 @@ export interface TrainingEvaluation {
   createdAt: string;
 }
 
+export interface ParsedYamlConfig {
+  config: Record<string, unknown>;
+}
+
+export interface KeywordEvalDetail {
+  question: string;
+  expected_keywords: string[];
+  answer: string;
+  hit_keywords: string[];
+  hit_rate: number;
+  strict_pass: boolean;
+}
+
+export interface KeywordEvalResult {
+  task_id: number;
+  total: number;
+  strict_pass_rate: number;
+  avg_hit_rate: number;
+  details: KeywordEvalDetail[];
+}
+
 const toTrainingConfig = (raw: any): TrainingConfig => ({
   id: raw.id,
   name: raw.name,
@@ -321,5 +342,43 @@ export const trainingService = {
       version: data.version,
       endpointUrl: data.endpoint_url
     };
+  },
+
+  async parseYamlConfig(yamlText: string, token: string): Promise<Record<string, unknown>> {
+    const data = await apiRequest<{ config: Record<string, unknown> }>('/api/training/yaml/parse', {
+      method: 'POST',
+      token,
+      body: { yaml_text: yamlText }
+    });
+    return data.config;
+  },
+
+  async createSftLoraTask(
+    payload: { name: string; description?: string; datasetId: number; modelType?: string; yamlText: string },
+    token: string
+  ): Promise<{ id: number; status: TrainingStatus }> {
+    const data = await apiRequest<{ task_id: number; status: TrainingStatus }>('/api/training/tasks/sft_lora', {
+      method: 'POST',
+      token,
+      body: {
+        name: payload.name,
+        description: payload.description,
+        dataset_id: payload.datasetId,
+        model_type: payload.modelType ?? 'flow_control',
+        yaml_text: payload.yamlText
+      }
+    });
+    return { id: data.task_id, status: data.status };
+  },
+
+  async evaluateKeywords(taskId: number, file: File, token: string): Promise<KeywordEvalResult> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const data = await apiRequest<KeywordEvalResult>(`/api/training/tasks/${taskId}/evaluate_keywords`, {
+      method: 'POST',
+      token,
+      body: formData
+    });
+    return data;
   }
 };

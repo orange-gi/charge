@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -35,9 +37,11 @@ from models import (
 )
 from schemas import (
     DatasetUploadResponse,
+    KeywordEvalResponse,
     ModelPublishRequest,
     ModelPublishResponse,
     ModelVersionCreateResponse,
+    SftLoraTaskCreateRequest,
     TaskStartResponse,
     TrainingConfigRequest,
     TrainingConfigResponse,
@@ -49,6 +53,8 @@ from schemas import (
     TrainingTaskCreateResponse,
     TrainingTaskDetailResponse,
     TrainingTaskListResponse,
+    YamlParseRequest,
+    YamlParseResponse,
 )
 from services.training_service import get_training_service
 
@@ -70,6 +76,114 @@ def _dumps_json(data: dict[str, Any] | None) -> str | None:
     if data is None:
         return None
     return json.dumps(data)
+
+
+def _normalize_llamafactory_yaml(cfg: dict[str, Any]) -> dict[str, Any]:
+    """将用户提供的 YAML（LLaMAFactory 形式）收敛到后端训练 worker 需要的最小字段集合。"""
+
+    def get(key: str, default: Any = None) -> Any:
+        return cfg.get(key, default)
+
+    normalized = {
+        # model
+        "model_name_or_path": get("model_name_or_path"),
+        # method
+        "stage": get("stage", "sft"),
+        "do_train": bool(get("do_train", True)),
+        "finetuning_type": get("finetuning_type", "lora"),
+        "lora_target": get("lora_target", "all"),
+        "lora_rank": int(get("lora_rank", 8)),
+        "lora_alpha": int(get("lora_alpha", 16)),
+        "lora_dropout": float(get("lora_dropout", 0.05)),
+        # dataset
+        "dataset": get("dataset"),
+        "template": get("template", "qwen"),
+        "cutoff_len": int(get("cutoff_len", 1024)),
+        "max_samples": int(get("max_samples", 1000000)),
+        "overwrite_cache": bool(get("overwrite_cache", True)),
+        "preprocessing_num_workers": int(get("preprocessing_num_workers", 1)),
+        # output
+        "output_dir": get("output_dir"),
+        "logging_steps": int(get("logging_steps", 10)),
+        "save_steps": int(get("save_steps", 100)),
+        "plot_loss": bool(get("plot_loss", False)),
+        "overwrite_output_dir": bool(get("overwrite_output_dir", True)),
+        # train
+        "per_device_train_batch_size": int(get("per_device_train_batch_size", 1)),
+        "gradient_accumulation_steps": int(get("gradient_accumulation_steps", 1)),
+        "learning_rate": float(get("learning_rate", 5e-4)),
+        "num_train_epochs": float(get("num_train_epochs", 1.0)),
+        "lr_scheduler_type": get("lr_scheduler_type", "cosine"),
+        "warmup_ratio": float(get("warmup_ratio", 0.0)),
+        "bf16": bool(get("bf16", False)),
+        "ddp_timeout": int(get("ddp_timeout", 180000000)),
+        # eval
+        "val_size": float(get("val_size", 0.0)),
+        "per_device_eval_batch_size": int(get("per_device_eval_batch_size", 1)),
+        "eval_strategy": get("eval_strategy", "no"),
+        "eval_steps": int(get("eval_steps", 50)),
+        # misc
+        "seed": int(get("seed", 42)),
+    }
+
+    if not normalized["model_name_or_path"]:
+        raise ValueError("缺少 model_name_or_path")
+    if not normalized["output_dir"]:
+        raise ValueError("缺少 output_dir")
+    if normalized["stage"] != "sft":
+        raise ValueError("最小实现仅支持 stage: sft")
+    if normalized["finetuning_type"] != "lora":
+        raise ValueError("最小实现仅支持 finetuning_type: lora")
+    if not normalized["do_train"]:
+        raise ValueError("do_train=false 当前不支持")
+    return normalized
+
+
+def _parse_yaml_text(yaml_text: str) -> dict[str, Any]:
+    try:
+        loaded = yaml.safe_load(yaml_text) or {}
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"YAML 解析失败: {exc}")
+    if not isinstance(loaded, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="YAML 顶层必须是 mapping（key-value）")
+    try:
+        return _normalize_llamafactory_yaml(loaded)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+def _count_json_samples(raw: bytes) -> int:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="ignore")
+    s = text.strip()
+    if not s:
+        return 0
+    # JSON / JSON array
+    if s[0] in "{[":
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return 0
+        if isinstance(obj, list):
+            return len([x for x in obj if isinstance(x, dict)])
+        if isinstance(obj, dict):
+            return 1
+        return 0
+    # JSONL
+    count = 0
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            count += 1
+    return count
 
 
 def _config_to_response(config: TrainingConfig) -> TrainingConfigResponse:
@@ -119,18 +233,24 @@ async def upload_dataset(
     if not raw:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
 
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("utf-8", errors="ignore")
-
-    lines = [line for line in text.splitlines() if line.strip()]
-    sample_count = max(0, len(lines) - 1)
+    filename = file.filename or "dataset"
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".json", ".jsonl"}:
+        sample_count = _count_json_samples(raw)
+        dataset_type = dataset_type or "sft_json"
+    else:
+        # 兼容旧逻辑：将非空行数 - 1 作为样本数（适配 csv header）
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="ignore")
+        lines = [line for line in text.splitlines() if line.strip()]
+        sample_count = max(0, len(lines) - 1)
 
     dataset_dir = Path(settings.upload_path) / "datasets" / str(user.id)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(datetime.utcnow().timestamp())
-    file_path = dataset_dir / f"{timestamp}_{file.filename}"
+    file_path = dataset_dir / f"{timestamp}_{filename}"
     file_path.write_bytes(raw)
 
     dataset = TrainingDataset(
@@ -147,6 +267,15 @@ async def upload_dataset(
     db.commit()
     db.refresh(dataset)
     return DatasetUploadResponse(dataset_id=dataset.id, sample_count=sample_count)
+
+
+@router.post("/yaml/parse", response_model=YamlParseResponse)
+def parse_training_yaml(
+    payload: YamlParseRequest = Body(...),
+    user: User = Depends(get_current_user),
+) -> YamlParseResponse:
+    config = _parse_yaml_text(payload.yaml_text)
+    return YamlParseResponse(config=config)
 
 
 @router.get("/configs", response_model=list[TrainingConfigResponse])
@@ -313,6 +442,210 @@ def create_task(
     db.refresh(task)
     return TrainingTaskCreateResponse(task_id=task.id, status=task.status.value)
 
+
+@router.post("/tasks/sft_lora", response_model=TrainingTaskCreateResponse)
+def create_sft_lora_task(
+    payload: SftLoraTaskCreateRequest = Body(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TrainingTaskCreateResponse:
+    dataset = (
+        db.query(TrainingDataset)
+        .filter(TrainingDataset.id == payload.dataset_id, TrainingDataset.created_by == user.id)
+        .first()
+    )
+    if dataset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="数据集不存在或无权限")
+
+    cfg = _parse_yaml_text(payload.yaml_text)
+
+    # 仅支持 1.5b / 7b 的 UI 约束：用 model_name_or_path 粗略推断
+    m = str(cfg.get("model_name_or_path") or "").lower()
+    model_size = "7b" if "7b" in m else "1.5b"
+
+    total_epochs = int(math.ceil(float(cfg.get("num_train_epochs") or 1.0)))
+    hyper = {
+        "llamafactory_yaml": cfg,
+        "llamafactory_yaml_raw": payload.yaml_text,
+    }
+
+    task = TrainingTask(
+        name=payload.name,
+        description=payload.description,
+        dataset_id=payload.dataset_id,
+        config_id=None,
+        model_type=payload.model_type,
+        adapter_type="lora",
+        model_size=model_size,
+        hyperparameters=json.dumps(hyper, ensure_ascii=False),
+        status=TrainingStatus.PENDING,
+        progress=0.0,
+        total_epochs=total_epochs,
+        total_steps=None,
+        created_by=user.id,
+        model_path=str(cfg.get("output_dir") or ""),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return TrainingTaskCreateResponse(task_id=task.id, status=task.status.value)
+
+
+@router.post("/tasks/{task_id}/evaluate_keywords", response_model=KeywordEvalResponse)
+async def evaluate_keywords(
+    task_id: int,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> KeywordEvalResponse:
+    """基于用户上传的评估集（JSON）做关键词命中评估，并同步写入 TrainingEvaluation。"""
+    task = db.query(TrainingTask).filter(TrainingTask.id == task_id, TrainingTask.created_by == user.id).first()
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+
+    if not task.model_path:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="任务缺少模型输出路径（output_dir）")
+
+    try:
+        hyper = json.loads(task.hyperparameters or "{}")
+    except Exception:
+        hyper = {}
+    cfg = hyper.get("llamafactory_yaml") if isinstance(hyper, dict) else None
+    if not isinstance(cfg, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="任务缺少 llamafactory_yaml 配置")
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", errors="ignore")
+    try:
+        items = json.loads(text)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"评估集 JSON 解析失败: {exc}")
+    if not isinstance(items, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="评估集 JSON 顶层必须是数组")
+
+    # lazy import（避免无 GPU 环境启动时开销）
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    base_model = cfg.get("model_name_or_path")
+    if not base_model:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="llamafactory_yaml 缺少 model_name_or_path")
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True, use_fast=False)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else None,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+    model = PeftModel.from_pretrained(model, task.model_path)
+    model.eval()
+
+    details = []
+    strict_pass = 0
+    hit_rate_sum = 0.0
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        question = str(it.get("question") or "").strip()
+        expected = it.get("expected_keywords") or []
+        expected = [str(x) for x in expected if str(x).strip()]
+        if not question:
+            continue
+
+        # Qwen-style chat prompt（最小实现）
+        messages = [
+            {"role": "system", "content": "新能源充放电专家"},
+            {"role": "user", "content": question},
+        ]
+        try:
+            inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+        except Exception:
+            prompt = f"[SYSTEM]新能源充放电专家\n[USER]{question}\n[ASSISTANT]"
+            inputs = tokenizer(prompt, return_tensors="pt").input_ids
+
+        if isinstance(inputs, dict):
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask")
+        else:
+            input_ids = inputs
+            attention_mask = None
+
+        if torch.cuda.is_available():
+            input_ids = input_ids.to(model.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model.device)
+
+        with torch.no_grad():
+            out = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=256,
+                do_sample=False,
+            )
+
+        gen = out[0][input_ids.shape[-1] :]
+        answer = tokenizer.decode(gen, skip_special_tokens=True).strip()
+
+        hit_keywords = []
+        for kw in expected:
+            if not kw:
+                continue
+            if kw in answer:
+                hit_keywords.append(kw)
+                continue
+            # 英文大小写兼容
+            if kw.lower() in answer.lower():
+                hit_keywords.append(kw)
+
+        hit_rate = (len(hit_keywords) / len(expected)) if expected else 0.0
+        strict_ok = bool(expected) and len(hit_keywords) == len(expected)
+        if strict_ok:
+            strict_pass += 1
+        hit_rate_sum += hit_rate
+
+        details.append(
+            {
+                "question": question,
+                "expected_keywords": expected,
+                "answer": answer,
+                "hit_keywords": hit_keywords,
+                "hit_rate": round(hit_rate, 4),
+                "strict_pass": strict_ok,
+            }
+        )
+
+    total = len(details)
+    strict_pass_rate = round((strict_pass / total) if total else 0.0, 4)
+    avg_hit_rate = round((hit_rate_sum / total) if total else 0.0, 4)
+
+    # 写入评估记录（用于前端“训练评估”页复用展示）
+    evaluation = task.evaluation or TrainingEvaluation(task_id=task.id, created_by=user.id, evaluator=user.username or user.email)
+    evaluation.evaluation_type = "keyword"
+    evaluation.metrics = json.dumps(
+        {"strict_pass_rate": strict_pass_rate, "avg_hit_rate": avg_hit_rate, "total": total},
+        ensure_ascii=False,
+    )
+    evaluation.recommended_plan = "keyword_eval"
+    evaluation.notes = f"关键词评估完成：strict_pass_rate={strict_pass_rate} avg_hit_rate={avg_hit_rate} total={total}"
+    db.add(evaluation)
+    db.commit()
+
+    return KeywordEvalResponse(
+        task_id=task.id,
+        total=total,
+        strict_pass_rate=strict_pass_rate,
+        avg_hit_rate=avg_hit_rate,
+        details=details,
+    )
 
 @router.get("/tasks", response_model=TrainingTaskListResponse)
 def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
