@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
+import traceback
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -376,166 +378,180 @@ def _split_train_eval(items: list[dict[str, Any]], val_size: float, seed: int) -
 
 
 def run(task_id: int) -> None:
-    # 读取任务与配置
-    with session_scope() as session:
-        task = session.get(TrainingTask, task_id)
-        if task is None:
+    try:
+        _append_log(
+            task_id,
+            "worker 启动",
+            meta={
+                "pid": os.getpid(),
+                "cuda_available": torch.cuda.is_available(),
+                "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                "bf16_supported": torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+            },
+        )
+
+        # 读取任务与配置
+        with session_scope() as session:
+            task = session.get(TrainingTask, task_id)
+            if task is None:
+                return
+            dataset = session.get(TrainingDataset, task.dataset_id) if task.dataset_id else None
+            hyper = _safe_json_loads(task.hyperparameters) or {}
+
+        cfg = hyper.get("llamafactory_yaml")
+        if not isinstance(cfg, dict):
+            _append_log(task_id, "任务缺少 llamafactory_yaml 配置，无法执行真实训练", level=LogLevel.ERROR)
+            _update_task(task_id, status=TrainingStatus.FAILED, error_message="missing llamafactory_yaml")
             return
-        dataset = session.get(TrainingDataset, task.dataset_id) if task.dataset_id else None
-        hyper = _safe_json_loads(task.hyperparameters) or {}
 
-    cfg = hyper.get("llamafactory_yaml")
-    if not isinstance(cfg, dict):
-        _append_log(task_id, "任务缺少 llamafactory_yaml 配置，无法执行真实训练", level=LogLevel.ERROR)
-        _update_task(task_id, status=TrainingStatus.FAILED, error_message="missing llamafactory_yaml")
-        return
-
-    try:
         cfg = _normalize_llamafactory_yaml(cfg)
-    except Exception as exc:
-        _append_log(task_id, f"YAML 配置校验失败: {exc}", level=LogLevel.ERROR)
-        _update_task(task_id, status=TrainingStatus.FAILED, error_message=str(exc))
-        return
 
-    if dataset is None or not dataset.file_path:
-        _append_log(task_id, "任务未绑定训练数据集或数据集文件不存在", level=LogLevel.ERROR)
-        _update_task(task_id, status=TrainingStatus.FAILED, error_message="missing dataset")
-        return
+        if dataset is None or not dataset.file_path:
+            _append_log(task_id, "任务未绑定训练数据集或数据集文件不存在", level=LogLevel.ERROR)
+            _update_task(task_id, status=TrainingStatus.FAILED, error_message="missing dataset")
+            return
 
-    output_dir = Path(cfg["output_dir"])
-    if cfg.get("overwrite_output_dir") and output_dir.exists():
-        shutil.rmtree(output_dir, ignore_errors=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = Path(cfg["output_dir"])
+        if cfg.get("overwrite_output_dir") and output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    _append_log(task_id, "开始加载训练数据集", meta={"dataset_path": dataset.file_path})
-    all_samples = _read_json_or_jsonl(dataset.file_path)
-    if not all_samples:
-        _append_log(task_id, "训练数据集为空或解析失败", level=LogLevel.ERROR)
-        _update_task(task_id, status=TrainingStatus.FAILED, error_message="empty dataset")
-        return
+        _append_log(task_id, "开始加载训练数据集", meta={"dataset_path": dataset.file_path})
+        all_samples = _read_json_or_jsonl(dataset.file_path)
+        if not all_samples:
+            _append_log(task_id, "训练数据集为空或解析失败", level=LogLevel.ERROR)
+            _update_task(task_id, status=TrainingStatus.FAILED, error_message="empty dataset")
+            return
 
-    max_samples = int(cfg.get("max_samples") or len(all_samples))
-    all_samples = all_samples[: max_samples]
+        max_samples = int(cfg.get("max_samples") or len(all_samples))
+        all_samples = all_samples[: max_samples]
 
-    train_samples, eval_samples = _split_train_eval(all_samples, float(cfg.get("val_size") or 0.0), int(cfg.get("seed") or 42))
-    _append_log(
-        task_id,
-        "数据集切分完成",
-        meta={"total": len(all_samples), "train": len(train_samples), "eval": len(eval_samples)},
-    )
+        train_samples, eval_samples = _split_train_eval(
+            all_samples, float(cfg.get("val_size") or 0.0), int(cfg.get("seed") or 42)
+        )
+        _append_log(
+            task_id,
+            "数据集切分完成",
+            meta={"total": len(all_samples), "train": len(train_samples), "eval": len(eval_samples)},
+        )
 
-    # 模型与 tokenizer
-    model_name_or_path = cfg["model_name_or_path"]
-    _append_log(task_id, "开始加载 tokenizer / base model（可能较慢）", meta={"model_name_or_path": model_name_or_path})
+        # 模型与 tokenizer
+        model_name_or_path = cfg["model_name_or_path"]
+        _append_log(task_id, "开始加载 tokenizer / base model（可能较慢）", meta={"model_name_or_path": model_name_or_path})
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, use_fast=False)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True, use_fast=False)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    torch_dtype = None
-    use_bf16 = bool(cfg.get("bf16"))
-    if use_bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        torch_dtype = torch.bfloat16
-    elif torch.cuda.is_available():
-        torch_dtype = torch.float16
+        torch_dtype = None
+        use_bf16 = bool(cfg.get("bf16"))
+        if use_bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            torch_dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            torch_dtype = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=True,
-        torch_dtype=torch_dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
 
-    # LoRA
-    lora_target = cfg.get("lora_target", "all")
-    target_modules: Any
-    if isinstance(lora_target, str) and lora_target.lower() == "all":
-        target_modules = "all-linear"
-    elif isinstance(lora_target, str):
-        target_modules = [x.strip() for x in lora_target.split(",") if x.strip()]
-    else:
-        target_modules = lora_target
+        # LoRA
+        lora_target = cfg.get("lora_target", "all")
+        target_modules: Any
+        if isinstance(lora_target, str) and lora_target.lower() == "all":
+            target_modules = "all-linear"
+        elif isinstance(lora_target, str):
+            target_modules = [x.strip() for x in lora_target.split(",") if x.strip()]
+        else:
+            target_modules = lora_target
 
-    lora_config = LoraConfig(
-        r=int(cfg["lora_rank"]),
-        lora_alpha=int(cfg["lora_alpha"]),
-        lora_dropout=float(cfg["lora_dropout"]),
-        target_modules=target_modules,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    try:
-        model.print_trainable_parameters()
-    except Exception:
-        pass
+        lora_config = LoraConfig(
+            r=int(cfg["lora_rank"]),
+            lora_alpha=int(cfg["lora_alpha"]),
+            lora_dropout=float(cfg["lora_dropout"]),
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
 
-    # 数据集
-    train_ds = SftJsonDataset(tokenizer, train_samples, cutoff_len=int(cfg["cutoff_len"]), template=str(cfg.get("template") or "qwen"))
-    eval_ds = (
-        SftJsonDataset(tokenizer, eval_samples, cutoff_len=int(cfg["cutoff_len"]), template=str(cfg.get("template") or "qwen"))
-        if eval_samples
-        else None
-    )
-    if len(train_ds) == 0:
-        _append_log(task_id, "编码后训练样本为 0（可能字段缺失）", level=LogLevel.ERROR)
-        _update_task(task_id, status=TrainingStatus.FAILED, error_message="no encoded train samples")
-        return
+        # 数据集
+        train_ds = SftJsonDataset(
+            tokenizer,
+            train_samples,
+            cutoff_len=int(cfg["cutoff_len"]),
+            template=str(cfg.get("template") or "qwen"),
+        )
+        eval_ds = (
+            SftJsonDataset(
+                tokenizer,
+                eval_samples,
+                cutoff_len=int(cfg["cutoff_len"]),
+                template=str(cfg.get("template") or "qwen"),
+            )
+            if eval_samples
+            else None
+        )
+        if len(train_ds) == 0:
+            _append_log(task_id, "编码后训练样本为 0（可能字段缺失）", level=LogLevel.ERROR)
+            _update_task(task_id, status=TrainingStatus.FAILED, error_message="no encoded train samples")
+            return
 
-    total_epochs = int(math.ceil(float(cfg["num_train_epochs"])))
-    _update_task(task_id, total_epochs=total_epochs, model_path=str(output_dir))
+        total_epochs = int(math.ceil(float(cfg["num_train_epochs"])))
+        _update_task(task_id, total_epochs=total_epochs, model_path=str(output_dir))
 
-    # TrainingArguments
-    eval_strategy = str(cfg.get("eval_strategy") or "no")
-    if eval_strategy not in {"no", "steps", "epoch"}:
-        eval_strategy = "no"
+        # TrainingArguments
+        eval_strategy = str(cfg.get("eval_strategy") or "no")
+        if eval_strategy not in {"no", "steps", "epoch"}:
+            eval_strategy = "no"
 
-    args = TrainingArguments(
-        output_dir=str(output_dir),
-        per_device_train_batch_size=int(cfg["per_device_train_batch_size"]),
-        gradient_accumulation_steps=int(cfg["gradient_accumulation_steps"]),
-        learning_rate=float(cfg["learning_rate"]),
-        num_train_epochs=float(cfg["num_train_epochs"]),
-        lr_scheduler_type=str(cfg["lr_scheduler_type"]),
-        warmup_ratio=float(cfg["warmup_ratio"]),
-        logging_steps=int(cfg["logging_steps"]),
-        save_steps=int(cfg["save_steps"]),
-        evaluation_strategy=eval_strategy,
-        eval_steps=int(cfg["eval_steps"]),
-        per_device_eval_batch_size=int(cfg["per_device_eval_batch_size"]),
-        bf16=bool(cfg.get("bf16")) and torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        fp16=(not bool(cfg.get("bf16"))) and torch.cuda.is_available(),
-        report_to=[],
-        remove_unused_columns=False,
-        save_total_limit=3,
-    )
+        args = TrainingArguments(
+            output_dir=str(output_dir),
+            per_device_train_batch_size=int(cfg["per_device_train_batch_size"]),
+            gradient_accumulation_steps=int(cfg["gradient_accumulation_steps"]),
+            learning_rate=float(cfg["learning_rate"]),
+            num_train_epochs=float(cfg["num_train_epochs"]),
+            lr_scheduler_type=str(cfg["lr_scheduler_type"]),
+            warmup_ratio=float(cfg["warmup_ratio"]),
+            logging_steps=int(cfg["logging_steps"]),
+            save_steps=int(cfg["save_steps"]),
+            evaluation_strategy=eval_strategy,
+            eval_steps=int(cfg["eval_steps"]),
+            per_device_eval_batch_size=int(cfg["per_device_eval_batch_size"]),
+            bf16=bool(cfg.get("bf16")) and torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+            fp16=(not bool(cfg.get("bf16"))) and torch.cuda.is_available(),
+            report_to=[],
+            remove_unused_columns=False,
+            save_total_limit=3,
+        )
 
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        data_collator=DataCollatorForCausalLMPadded(tokenizer),
-        callbacks=[DBCallback(task_id)],
-    )
+        trainer = Trainer(
+            model=model,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            data_collator=DataCollatorForCausalLMPadded(tokenizer),
+            callbacks=[DBCallback(task_id)],
+        )
 
-    _append_log(task_id, "开始训练", meta={"output_dir": str(output_dir)})
-    start = time.time()
-    try:
+        _append_log(task_id, "开始训练", meta={"output_dir": str(output_dir)})
+        start = time.time()
         trainer.train()
         duration = int(time.time() - start)
 
-        # 保存 LoRA adapter + tokenizer
         model.save_pretrained(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
-
-        # 保存本次训练配置快照（便于复现）
-        (output_dir / "llamafactory_config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        (output_dir / "llamafactory_config.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         _update_task(task_id, status=TrainingStatus.COMPLETED, progress=100.0, end_time=_utc_now())
         _append_log(task_id, "训练完成", meta={"duration_seconds": duration, "output_dir": str(output_dir)})
     except Exception as exc:
-        _append_log(task_id, f"训练失败: {exc}", level=LogLevel.ERROR)
+        tb = traceback.format_exc()
+        _append_log(task_id, f"worker 异常退出: {exc}", level=LogLevel.ERROR, meta={"traceback": tb})
         _update_task(task_id, status=TrainingStatus.FAILED, error_message=str(exc), end_time=_utc_now())
 
 
