@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from config import get_settings
 from database import session_scope
 from models import LogLevel, TrainingLog, TrainingMetrics, TrainingStatus, TrainingTask
 
@@ -54,6 +55,7 @@ class TrainingService:
                 return None
 
     def _start_real_training_subprocess(self, task_id: int) -> None:
+        settings = get_settings()
         backend_dir = Path(__file__).resolve().parents[1]  # charge-analysis-backend/
         python = sys.executable
 
@@ -67,28 +69,55 @@ class TrainingService:
             task.progress = 0.0
             session.add(task)
 
-        self._append_log(task_id, "启动真实训练子进程（sft + lora）", meta={"cwd": str(backend_dir), "python": python})
+        run_dir = Path(settings.upload_path) / "training_runs" / str(task_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        log_path = run_dir / "worker.log"
+
+        self._append_log(
+            task_id,
+            "启动真实训练子进程（sft + lora）",
+            meta={"cwd": str(backend_dir), "python": python, "worker_log": str(log_path)},
+        )
 
         env = os.environ.copy()
 
         # 将超时（ddp_timeout）交给 worker 自己处理；这里只负责拉起
         cmd = [python, "-m", "services.sft_lora_worker", "--task-id", str(task_id)]
         try:
-            subprocess.Popen(
-                cmd,
-                cwd=str(backend_dir),
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            with open(log_path, "ab", buffering=0) as fp:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(backend_dir),
+                    env=env,
+                    stdout=fp,
+                    stderr=fp,
+                    start_new_session=True,
+                )
         except Exception as exc:
             self._append_log(task_id, f"启动训练子进程失败: {exc}", level=LogLevel.ERROR)
             self._mark_failed(task_id, str(exc))
             return
 
+        # 记录运行信息（便于排障）
+        try:
+            with session_scope() as session:
+                task = session.get(TrainingTask, task_id)
+                if task is not None:
+                    task.logs = json.dumps(
+                        {
+                            "worker_pid": proc.pid,
+                            "worker_cmd": cmd,
+                            "worker_cwd": str(backend_dir),
+                            "worker_log": str(log_path),
+                        },
+                        ensure_ascii=False,
+                    )
+                    session.add(task)
+        except Exception:
+            pass
+
         # worker 会自行推进日志/指标与最终状态，这里直接返回即可
-        self._append_log(task_id, "训练子进程已启动，开始异步写入训练日志/指标")
+        self._append_log(task_id, "训练子进程已启动，开始异步写入训练日志/指标", meta={"pid": proc.pid})
 
     async def _simulate_training(self, task_id: int) -> None:
         with session_scope() as session:
