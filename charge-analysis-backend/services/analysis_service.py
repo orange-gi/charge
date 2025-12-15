@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -207,7 +208,8 @@ class AnalysisService:
             analysis.status = self._map_workflow_status(workflow_status)
             analysis.progress = 100.0 if analysis.status == AnalysisStatus.COMPLETED else analysis.progress
             analysis.completed_at = datetime.utcnow()
-            analysis.result_data = json.dumps(summary_payload, ensure_ascii=False)
+            # 保证写入数据库的是严格 JSON（禁止 NaN/Infinity）
+            analysis.result_data = json.dumps(summary_payload, ensure_ascii=False, allow_nan=False)
 
             # 清理旧结果
             session.query(AnalysisResult).filter(
@@ -296,6 +298,11 @@ class AnalysisService:
             # 处理 None
             if obj is None:
                 return None
+
+            # 处理 NaN / Infinity（Python json.dumps 默认 allow_nan=True 会生成 NaN/Infinity，前端 JSON.parse 会失败）
+            if isinstance(obj, float):
+                if math.isnan(obj) or math.isinf(obj):
+                    return None
             
             # 处理 datetime
             if isinstance(obj, datetime):
@@ -315,7 +322,10 @@ class AnalysisService:
                                    np.uint32, np.uint64)):
                     return int(obj)
                 if isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
-                    return float(obj)
+                    val = float(obj)
+                    if math.isnan(val) or math.isinf(val):
+                        return None
+                    return val
                 if isinstance(obj, np.ndarray):
                     return obj.tolist()
             except ImportError:
