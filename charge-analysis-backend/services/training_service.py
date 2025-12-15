@@ -69,7 +69,12 @@ class TrainingService:
             task.progress = 0.0
             session.add(task)
 
-        run_dir = Path(settings.upload_path) / "training_runs" / str(task_id)
+        base_upload = Path(settings.upload_path)
+        # 统一成绝对路径，避免 cwd 不同导致找不到文件
+        if not base_upload.is_absolute():
+            base_upload = (Path.cwd() / base_upload).resolve()
+
+        run_dir = base_upload / "training_runs" / str(task_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         log_path = run_dir / "worker.log"
 
@@ -84,7 +89,11 @@ class TrainingService:
         # 将超时（ddp_timeout）交给 worker 自己处理；这里只负责拉起
         cmd = [python, "-m", "services.sft_lora_worker", "--task-id", str(task_id)]
         try:
+            # 先落一行，确保文件必定生成（便于排障：区分“没生成”vs“没写入”）
+            run_header = f"[launcher] utc={datetime.utcnow().isoformat()} task_id={task_id}\n".encode("utf-8")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "ab", buffering=0) as fp:
+                fp.write(run_header)
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(backend_dir),
