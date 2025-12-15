@@ -1,10 +1,21 @@
-"""训练任务模拟服务，负责异步推进任务、记录指标与日志。"""
+"""训练服务。
+
+历史上该模块仅用于模拟训练（sleep + 随机指标），用于打通前后端流程。
+本次改造新增了一个“最小化 LLaMAFactory-like 的 sft lora 训练”实现：
+- API 侧：通过 BackgroundTasks 调起本服务（注意 BackgroundTasks 只支持同步 callable）
+- 本服务：优先启动独立子进程执行真实训练（transformers + peft），并写入训练日志/指标到数据库
+- 兼容：如果任务没有携带训练所需的 YAML/超参配置，则回退到原有模拟流程
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import random
+import os
+import subprocess
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from database import session_scope
@@ -15,7 +26,71 @@ class TrainingService:
     def __init__(self, steps_per_epoch: int = 50) -> None:
         self.steps_per_epoch = steps_per_epoch
 
-    async def start_training(self, task_id: int) -> None:
+    def start_training(self, task_id: int) -> None:
+        """后台启动训练（供 BackgroundTasks 调用）。
+
+        - 若任务携带了最小训练配置（hyperparameters 内含 llamafactory_yaml），则启动子进程执行真实训练。
+        - 否则回退到模拟训练，避免旧数据/旧任务直接报错。
+        """
+        try:
+            hyper = self._get_task_hyperparameters(task_id)
+            if hyper and isinstance(hyper, dict) and hyper.get("llamafactory_yaml"):
+                self._start_real_training_subprocess(task_id)
+                return
+        except Exception as exc:  # pragma: no cover
+            self._append_log(task_id, f"读取训练配置失败，将回退到模拟训练: {exc}", level=LogLevel.WARNING)
+
+        # fallback：模拟训练（保持历史行为）
+        asyncio.run(self._simulate_training(task_id))
+
+    def _get_task_hyperparameters(self, task_id: int) -> dict[str, Any] | None:
+        with session_scope() as session:
+            task = session.get(TrainingTask, task_id)
+            if task is None or not task.hyperparameters:
+                return None
+            try:
+                return json.loads(task.hyperparameters)
+            except Exception:
+                return None
+
+    def _start_real_training_subprocess(self, task_id: int) -> None:
+        backend_dir = Path(__file__).resolve().parents[1]  # charge-analysis-backend/
+        python = sys.executable
+
+        # 预先把任务标为 RUNNING（worker 也会再次校正）
+        with session_scope() as session:
+            task = session.get(TrainingTask, task_id)
+            if task is None:
+                return
+            task.status = TrainingStatus.RUNNING
+            task.start_time = datetime.utcnow()
+            task.progress = 0.0
+            session.add(task)
+
+        self._append_log(task_id, "启动真实训练子进程（sft + lora）", meta={"cwd": str(backend_dir), "python": python})
+
+        env = os.environ.copy()
+
+        # 将超时（ddp_timeout）交给 worker 自己处理；这里只负责拉起
+        cmd = [python, "-m", "services.sft_lora_worker", "--task-id", str(task_id)]
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=str(backend_dir),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self._append_log(task_id, f"启动训练子进程失败: {exc}", level=LogLevel.ERROR)
+            self._mark_failed(task_id, str(exc))
+            return
+
+        # worker 会自行推进日志/指标与最终状态，这里直接返回即可
+        self._append_log(task_id, "训练子进程已启动，开始异步写入训练日志/指标")
+
+    async def _simulate_training(self, task_id: int) -> None:
         with session_scope() as session:
             task = session.get(TrainingTask, task_id)
             if task is None:
@@ -25,11 +100,8 @@ class TrainingService:
             task.progress = 0.0
             session.add(task)
             total_epochs = task.total_epochs or 10
-        self._append_log(
-            task_id,
-            f"任务进入运行状态，计划 {total_epochs} 个 epoch",
-            meta={"total_epochs": total_epochs},
-        )
+
+        self._append_log(task_id, f"任务进入运行状态（模拟训练），计划 {total_epochs} 个 epoch", meta={"total_epochs": total_epochs})
 
         try:
             total_steps = total_epochs * self.steps_per_epoch

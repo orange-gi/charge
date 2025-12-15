@@ -551,6 +551,46 @@ class TrainingTaskCreateRequest(BaseModel):
     )
 
 
+class YamlParseRequest(BaseModel):
+    yaml_text: str = Field(min_length=1, description="YAML 配置内容（LLaMAFactory 风格的最小子集）")
+
+
+class YamlParseResponse(BaseModel):
+    config: dict[str, Any]
+
+
+class SftLoraTaskCreateRequest(BaseModel):
+    """通过 YAML 一键创建 sft+lora 训练任务（最小化 llamafactory-cli train）。"""
+
+    name: str
+    description: Optional[str] = None
+    dataset_id: int
+    model_type: str = Field(default="flow_control")
+    yaml_text: str = Field(min_length=1)
+
+
+class KeywordEvalItem(BaseModel):
+    question: str = Field(min_length=1)
+    expected_keywords: list[str] = Field(default_factory=list)
+
+
+class KeywordEvalDetail(BaseModel):
+    question: str
+    expected_keywords: list[str]
+    answer: str
+    hit_keywords: list[str]
+    hit_rate: float
+    strict_pass: bool
+
+
+class KeywordEvalResponse(BaseModel):
+    task_id: int
+    total: int
+    strict_pass_rate: float
+    avg_hit_rate: float
+    details: list[KeywordEvalDetail]
+
+
 class TrainingTaskResponse(BaseModel):
     id: int
     name: str

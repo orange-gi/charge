@@ -40,7 +40,8 @@ import {
   TrainingTaskDetail,
   TrainingMetricPoint,
   TrainingLogEntry,
-  TrainingEvaluation
+  TrainingEvaluation,
+  KeywordEvalResult
 } from '../../services/trainingService';
 
 const { Content, Sider } = Layout;
@@ -78,6 +79,57 @@ const TrainingCenter: React.FC = () => {
   const [publishing, setPublishing] = React.useState(false);
   const [loadingTaskDetail, setLoadingTaskDetail] = React.useState(false);
 
+  const [yamlText, setYamlText] = React.useState<string>(`### model
+model_name_or_path: /opt/app/models/deepseek-7B
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+
+### dataset
+dataset: "2015"
+template: qwen
+cutoff_len: 1024
+max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 16
+
+### output
+output_dir: saves/deepseek-r1-qwen1.5b/lora/sft
+logging_steps: 10
+save_steps: 100
+plot_loss: true
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 5.0e-4
+num_train_epochs: 5.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+val_size: 0.1
+per_device_eval_batch_size: 2
+eval_strategy: steps
+eval_steps: 50
+`);
+  const [yamlFile, setYamlFile] = React.useState<File | null>(null);
+  const [parsedYaml, setParsedYaml] = React.useState<Record<string, any> | null>(null);
+  const [parsingYaml, setParsingYaml] = React.useState(false);
+
+  const [evalFile, setEvalFile] = React.useState<File | null>(null);
+  const [keywordEvalResult, setKeywordEvalResult] = React.useState<KeywordEvalResult | null>(null);
+  const [runningKeywordEval, setRunningKeywordEval] = React.useState(false);
+
   const [configForm] = Form.useForm();
   const [taskForm] = Form.useForm();
   const [evaluationForm] = Form.useForm();
@@ -92,6 +144,36 @@ const TrainingCenter: React.FC = () => {
       }
     } else {
       setDatasetFile(null);
+    }
+  };
+
+  const handleYamlFileChange = async (file: File | null) => {
+    setYamlFile(file);
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setYamlText(text);
+      message.success('已载入 YAML 文件内容');
+    } catch (e: any) {
+      message.error(e?.message || '读取 YAML 文件失败');
+    }
+  };
+
+  const handleParseYaml = async () => {
+    if (!ensureToken()) return;
+    if (!yamlText.trim()) {
+      message.warning('请先输入 YAML 内容');
+      return;
+    }
+    setParsingYaml(true);
+    try {
+      const cfg = await trainingService.parseYamlConfig(yamlText, token!);
+      setParsedYaml(cfg);
+      message.success('YAML 解析成功');
+    } catch (e: any) {
+      message.error(e?.message || 'YAML 解析失败');
+    } finally {
+      setParsingYaml(false);
     }
   };
 
@@ -291,23 +373,34 @@ const TrainingCenter: React.FC = () => {
     }
     setCreatingTask(true);
     try {
-      const hyperparameters = {
-        epochs: values.epochs,
-        batch_size: values.batchSize,
-        learning_rate: values.learningRate
-      };
-      const task = await trainingService.createTrainingTask(
-        {
-          name: values.taskName,
-          description: values.description,
-          datasetId: datasetInfo.id,
-          configId: values.configId,
-          modelType: 'flow_control',
-          modelSize: values.modelSize,
-          hyperparameters
-        },
-        token!
-      );
+      const useYaml = yamlText.trim().length > 0;
+      const task = useYaml
+        ? await trainingService.createSftLoraTask(
+            {
+              name: values.taskName,
+              description: values.description,
+              datasetId: datasetInfo.id,
+              modelType: 'flow_control',
+              yamlText
+            },
+            token!
+          )
+        : await trainingService.createTrainingTask(
+            {
+              name: values.taskName,
+              description: values.description,
+              datasetId: datasetInfo.id,
+              configId: values.configId,
+              modelType: 'flow_control',
+              modelSize: values.modelSize,
+              hyperparameters: {
+                epochs: values.epochs,
+                batch_size: values.batchSize,
+                learning_rate: values.learningRate
+              }
+            },
+            token!
+          );
       await trainingService.startTraining(task.id, token!);
       message.success('训练任务已创建并启动');
       taskForm.resetFields(['taskName', 'description']);
@@ -384,6 +477,26 @@ const TrainingCenter: React.FC = () => {
       message.error(error.message || '模型发布失败');
     } finally {
       setPublishing(false);
+    }
+  };
+
+  const handleRunKeywordEval = async () => {
+    if (!ensureToken() || !selectedTaskId) return;
+    if (!evalFile) {
+      message.warning('请先选择评估集 JSON 文件');
+      return;
+    }
+    setRunningKeywordEval(true);
+    try {
+      const result = await trainingService.evaluateKeywords(selectedTaskId, evalFile, token!);
+      setKeywordEvalResult(result);
+      message.success('关键词评估完成');
+      // 同步刷新“评估记录”（后端会写入 TrainingEvaluation）
+      loadTaskStreams(selectedTaskId);
+    } catch (e: any) {
+      message.error(e?.message || '关键词评估失败');
+    } finally {
+      setRunningKeywordEval(false);
     }
   };
 
@@ -491,7 +604,7 @@ const TrainingCenter: React.FC = () => {
           />
           <input
             type="file"
-            accept=".csv,.xlsx"
+            accept=".json,.jsonl,.csv,.xlsx"
             onChange={(e) => handleDatasetFileChange(e.target.files?.[0] || null)}
           />
           <Button
@@ -505,6 +618,30 @@ const TrainingCenter: React.FC = () => {
           {datasetInfo.id && (
             <Tag color="success">数据集 ID：{datasetInfo.id}（样本 {datasetInfo.sampleCount}）</Tag>
           )}
+        </Space>
+      </Card>
+      <Card title="YAML 配置（SFT + LoRA，最小化 llamafactory-cli train）">
+        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+          <Text type="secondary">
+            支持手动粘贴或上传 YAML。创建任务时若 YAML 非空，将优先使用 YAML 一键训练。
+          </Text>
+          <input
+            type="file"
+            accept=".yaml,.yml"
+            onChange={(e) => handleYamlFileChange(e.target.files?.[0] || null)}
+          />
+          <Input.TextArea
+            rows={14}
+            value={yamlText}
+            onChange={(e) => setYamlText(e.target.value)}
+            placeholder="粘贴/输入 llamafactory 风格的 YAML 配置"
+          />
+          <Space>
+            <Button onClick={handleParseYaml} loading={parsingYaml}>
+              解析 YAML
+            </Button>
+            {parsedYaml && <Tag color="blue">已解析：output_dir={(parsedYaml.output_dir as any) ?? '-'}</Tag>}
+          </Space>
         </Space>
       </Card>
       <Card title="创建训练任务">
@@ -549,6 +686,9 @@ const TrainingCenter: React.FC = () => {
           <Form.Item label="Learning Rate" name="learningRate" rules={[{ required: true }]}>
             <InputNumber min={0.0001} max={0.01} step={0.0001} style={{ width: '100%' }} />
           </Form.Item>
+          <Tag color={yamlText.trim() ? 'green' : 'default'}>
+            {yamlText.trim() ? '将使用 YAML 一键训练（SFT+LoRA）' : '未提供 YAML：将使用旧版简化参数（模拟/兼容）'}
+          </Tag>
           <Button type="primary" htmlType="submit" loading={creatingTask}>
             创建并启动训练
           </Button>
@@ -690,6 +830,55 @@ const TrainingCenter: React.FC = () => {
     }
     return (
       <Space direction="vertical" size="large" style={{ width: '100%' }}>
+        <Card title="关键词评估（上传 JSON 评估集）">
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Text type="secondary">
+              评估集格式：<Text code>[{`{"question":"...","expected_keywords":["..."]}`}]</Text>
+            </Text>
+            <input type="file" accept=".json" onChange={(e) => setEvalFile(e.target.files?.[0] || null)} />
+            <Button type="primary" onClick={handleRunKeywordEval} loading={runningKeywordEval}>
+              运行关键词评估
+            </Button>
+            {keywordEvalResult && (
+              <Card size="small" title="评估摘要">
+                <Space size="large">
+                  <Statistic title="总题数" value={keywordEvalResult.total} />
+                  <Statistic title="严格通过率" value={keywordEvalResult.strict_pass_rate} />
+                  <Statistic title="平均命中率" value={keywordEvalResult.avg_hit_rate} />
+                </Space>
+                <Divider />
+                <Table
+                  rowKey={(r) => r.question}
+                  dataSource={keywordEvalResult.details}
+                  pagination={{ pageSize: 5 }}
+                  columns={[
+                    { title: '问题', dataIndex: 'question' },
+                    {
+                      title: '命中率',
+                      dataIndex: 'hit_rate',
+                      render: (v: number) => <Tag>{v}</Tag>
+                    },
+                    {
+                      title: '严格通过',
+                      dataIndex: 'strict_pass',
+                      render: (v: boolean) => <Tag color={v ? 'green' : 'red'}>{String(v)}</Tag>
+                    }
+                  ]}
+                  expandable={{
+                    expandedRowRender: (r) => (
+                      <Space direction="vertical" style={{ width: '100%' }}>
+                        <Text type="secondary">期望关键词：{r.expected_keywords?.join('、') || '-'}</Text>
+                        <Text type="secondary">命中关键词：{r.hit_keywords?.join('、') || '-'}</Text>
+                        <Divider style={{ margin: '8px 0' }} />
+                        <Text>{r.answer}</Text>
+                      </Space>
+                    )
+                  }}
+                />
+              </Card>
+            )}
+          </Space>
+        </Card>
         <Card title="评估训练效果">
           <Form
             layout="vertical"
