@@ -117,13 +117,13 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 python3 -c "from database import init_db; init_db()"
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 后端服务启动后：
-- API 地址: http://127.0.0.1:8000
-- API 文档: http://127.0.0.1:8000/docs
-- 健康检查: http://127.0.0.1:8000/health
+- API 地址: http://127.0.0.1:8000（远程访问请用 http://<服务器IP>:8000）
+- API 文档: http://127.0.0.1:8000/docs（远程访问请用 http://<服务器IP>:8000/docs）
+- 健康检查: http://127.0.0.1:8000/health（远程访问请用 http://<服务器IP>:8000/health）
 
 ## 步骤 4: 启动前端服务
 
@@ -136,7 +136,7 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 # 方法 2: 手动启动
 cd charge-analysis-frontend
 pnpm install
-pnpm dev --host 127.0.0.1 --port 3000
+pnpm dev --host 0.0.0.0 --port 3000
 ```
 
 前端服务启动后访问: http://localhost:3000

@@ -38,7 +38,7 @@ fi
 
 # 启动开发服务器
 echo "🎯 启动前端开发服务器..."
-echo "   访问地址: http://localhost:3000"
+echo "   访问地址: http://0.0.0.0:3000（本机访问可用 http://127.0.0.1:3000）"
 echo ""
-pnpm dev --host 127.0.0.1 --port 3000
+pnpm dev --host 0.0.0.0 --port 3000
 
