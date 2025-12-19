@@ -27,12 +27,17 @@ chromadb==0.4.18
 sentence-transformers==3.0.1
 
 # Machine Learning
-torch==2.9.0
-torchvision==0.24.0
-torchaudio==2.9.0
+# CUDA 12.1 (cu121) PyTorch wheels:
+# - `torch/torchvision/torchaudio` 的 GPU 轮子不在 PyPI 上，需要额外的 wheel 源
+# - 若你只想 CPU 版本，请移除下一行并把版本号里的 `+cu121` 去掉
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
 transformers==4.46.0
 accelerate==1.1.0
-bitsandbytes==0.42.0
+# bitsandbytes 需匹配 CUDA 版本；0.43+ 系列开始提供 CUDA 12.1 的预编译支持
+bitsandbytes==0.43.3
 peft==0.13.2
 PyYAML==6.0.2
 
