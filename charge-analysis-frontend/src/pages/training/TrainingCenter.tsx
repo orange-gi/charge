@@ -78,6 +78,9 @@ const TrainingCenter: React.FC = () => {
   const [metricsLoading, setMetricsLoading] = React.useState(false);
   const [publishing, setPublishing] = React.useState(false);
   const [loadingTaskDetail, setLoadingTaskDetail] = React.useState(false);
+  const taskDetailReqSeq = React.useRef(0);
+  const taskStreamsReqSeq = React.useRef(0);
+  const logConsoleRef = React.useRef<HTMLDivElement | null>(null);
 
   const [yamlText, setYamlText] = React.useState<string>(`### model
 model_name_or_path: /opt/app/models/deepseek-7B
@@ -253,45 +256,72 @@ eval_steps: 50
   }, [token, selectedTaskId]);
 
   const loadTaskStreams = React.useCallback(
-    async (taskId: number) => {
+    async (taskId: number, options?: { silent?: boolean }) => {
       if (!token) return;
+      const silent = Boolean(options?.silent);
+      const reqId = ++taskStreamsReqSeq.current;
       try {
-        setMetricsLoading(true);
-        setLogsLoading(true);
+        if (!silent) {
+          setMetricsLoading(true);
+          setLogsLoading(true);
+        }
         const [metricsData, logsData, evaluationData] = await Promise.all([
           trainingService.getTaskMetrics(taskId, token),
           trainingService.getTaskLogs(taskId, token),
           trainingService.getTaskEvaluation(taskId, token)
         ]);
+        // 防止轮询请求乱序覆盖 UI
+        if (reqId !== taskStreamsReqSeq.current) return;
         setMetrics(metricsData);
         setLogs(logsData);
         setEvaluation(evaluationData);
       } catch (error: any) {
-        message.error(error.message || '加载训练进度失败');
+        // 静默刷新时不弹错，避免打断用户视线
+        if (!silent) {
+          message.error(error.message || '加载训练进度失败');
+        }
       } finally {
-        setMetricsLoading(false);
-        setLogsLoading(false);
+        if (!silent) {
+          setMetricsLoading(false);
+          setLogsLoading(false);
+        }
       }
     },
     [token]
   );
 
   const loadTaskDetail = React.useCallback(
-    async (taskId?: number, refreshStreams = true) => {
+    async (
+      taskId?: number,
+      options?: {
+        refreshStreams?: boolean;
+        silent?: boolean;
+      }
+    ) => {
       if (!token) return;
       const currentId = taskId ?? selectedTaskId;
       if (!currentId) return;
+      const refreshStreams = options?.refreshStreams ?? true;
+      const silent = Boolean(options?.silent);
+      const reqId = ++taskDetailReqSeq.current;
       try {
-        setLoadingTaskDetail(true);
+        if (!silent) {
+          setLoadingTaskDetail(true);
+        }
         const detail = await trainingService.getTask(currentId, token);
+        if (reqId !== taskDetailReqSeq.current) return;
         setSelectedTask(detail);
         if (refreshStreams) {
-          loadTaskStreams(currentId);
+          loadTaskStreams(currentId, { silent });
         }
       } catch (error: any) {
-        message.error(error.message || '获取任务详情失败');
+        if (!silent) {
+          message.error(error.message || '获取任务详情失败');
+        }
       } finally {
-        setLoadingTaskDetail(false);
+        if (!silent) {
+          setLoadingTaskDetail(false);
+        }
       }
     },
     [token, selectedTaskId, loadTaskStreams]
@@ -305,17 +335,32 @@ eval_steps: 50
 
   React.useEffect(() => {
     if (!selectedTaskId || !token) return;
-    loadTaskDetail(selectedTaskId);
+    loadTaskDetail(selectedTaskId, { refreshStreams: true, silent: false });
   }, [selectedTaskId, token, loadTaskDetail]);
 
   React.useEffect(() => {
     if (!token || !selectedTaskId) return;
     const interval = window.setInterval(() => {
-      loadTaskDetail(selectedTaskId, false);
-      loadTaskStreams(selectedTaskId);
+      // 轮询采用静默刷新：不触发 loading 骨架/Spin，避免进度页闪烁
+      loadTaskDetail(selectedTaskId, { refreshStreams: false, silent: true });
+      loadTaskStreams(selectedTaskId, { silent: true });
     }, 5000);
     return () => window.clearInterval(interval);
   }, [token, selectedTaskId, loadTaskDetail, loadTaskStreams]);
+
+  const recentLogs = React.useMemo(() => {
+    const sorted = [...logs].sort(
+      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+    );
+    return sorted.slice(Math.max(0, sorted.length - 200));
+  }, [logs]);
+
+  React.useEffect(() => {
+    // 新日志到来后自动滚动到最底部，体验更接近控制台
+    const el = logConsoleRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [recentLogs.length]);
 
   const handleDatasetUpload = async () => {
     if (!ensureToken() || !datasetFile || !datasetName) return;
@@ -802,21 +847,33 @@ eval_steps: 50
             <Divider />
             <div>
               <Title level={5}>最近日志</Title>
-              <List
-                loading={logsLoading}
-                dataSource={logs.slice(0, 8)}
-                renderItem={(item) => (
-                  <List.Item key={item.id}>
-                    <Space direction="vertical" size={0} style={{ width: '100%' }}>
-                      <Space>
-                        <Tag>{item.logLevel}</Tag>
-                        <Text type="secondary">{dayjs(item.createdAt).format('HH:mm:ss')}</Text>
-                      </Space>
-                      <Text>{item.message}</Text>
-                    </Space>
-                  </List.Item>
-                )}
-              />
+              {logsLoading && recentLogs.length === 0 ? (
+                <Spin />
+              ) : recentLogs.length === 0 ? (
+                <Empty description="暂无日志" />
+              ) : (
+                <div className="console-log" ref={logConsoleRef}>
+                  {recentLogs.map((item) => {
+                    const level = String(item.logLevel || '').toLowerCase();
+                    const levelClass =
+                      level.includes('error') || level.includes('fatal')
+                        ? 'level-error'
+                        : level.includes('warn')
+                          ? 'level-warn'
+                          : level.includes('debug')
+                            ? 'level-debug'
+                            : 'level-info';
+
+                    return (
+                      <div key={item.id} className="console-log-line">
+                        <span className="console-log-time">{dayjs(item.createdAt).format('HH:mm:ss')}</span>
+                        <span className={`console-log-level ${levelClass}`}>{item.logLevel}</span>
+                        <span className="console-log-message">{item.message}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </Space>
         </Card>

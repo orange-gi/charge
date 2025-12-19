@@ -13,3 +13,60 @@ body {
 #root {
   min-height: 100vh;
 }
+
+/* 训练中心：控制台日志样式 */
+.console-log {
+  background: #0b1020;
+  border: 1px solid #1f2937;
+  border-radius: 10px;
+  padding: 12px 12px;
+  max-height: 280px;
+  overflow: auto;
+  color: #e5e7eb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.console-log-line {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 2px 0;
+}
+
+.console-log-time {
+  flex: 0 0 auto;
+  color: #93c5fd;
+}
+
+.console-log-level {
+  flex: 0 0 auto;
+  min-width: 64px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  opacity: 0.95;
+}
+
+.console-log-message {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #e5e7eb;
+}
+
+.level-info {
+  color: #a7f3d0;
+}
+
+.level-debug {
+  color: #d1d5db;
+}
+
+.level-warn {
+  color: #fde68a;
+}
+
+.level-error {
+  color: #fca5a5;
+}
