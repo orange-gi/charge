@@ -127,7 +127,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 alembic upgrade head  # 同步数据库结构
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 - 首次运行若遇到 `psycopg` 编译失败，请执行 `pip install --upgrade setuptools wheel` 再重试。
@@ -142,14 +142,14 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```bash
 cd /c/workspace/charge-analysis-system/charge-analysis-frontend
 pnpm install  # 或 npm install
-pnpm dev --host 127.0.0.1 --port 3000
+pnpm dev --host 0.0.0.0 --port 3000
 ```
 
 - 访问 `http://127.0.0.1:3000` 查看前端。
 - 若需要生成生产构建：
   ```bash
   pnpm build
-  pnpm preview --host 127.0.0.1 --port 4173
+  pnpm preview --host 0.0.0.0 --port 4173
   ```
 
 ---

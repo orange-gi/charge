@@ -23,14 +23,21 @@ app = FastAPI(
 )
 
 # 重要：CORS 中间件必须在路由注册之前添加
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
+# 说明：
+# - 远程部署时，前端通常以 http://<服务器IP>:3000 访问；如果后端只允许 localhost，会被浏览器 CORS 拦截。
+# - 为了开箱即用：development 环境默认允许任意来源（通过 regex 回显具体 Origin，兼容 credentials）。
+# - 生产环境请设置 ENVIRONMENT=production 并显式配置 ALLOWED_ORIGINS。
+cors_common = dict(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+if str(getattr(settings, "environment", "development")).lower() in {"production", "prod"}:
+    app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins, **cors_common)
+else:
+    app.add_middleware(CORSMiddleware, allow_origin_regex=".*", **cors_common)
 
 # 使用国内可访问的 CDN 配置自定义 Swagger UI
 @app.get("/docs", include_in_schema=False)

@@ -30,6 +30,6 @@ if '/api/analyses' in routes_by_prefix:
 print("\n" + "=" * 70)
 print("💡 如果 cancel 路由存在，但访问时404，请重启后端服务:")
 print("   1. 停止当前服务 (Ctrl+C)")
-print("   2. 重新运行: uvicorn main:app --reload --host 127.0.0.1 --port 8000")
+print("   2. 重新运行: uvicorn main:app --reload --host 0.0.0.0 --port 8000")
 print("=" * 70)
 

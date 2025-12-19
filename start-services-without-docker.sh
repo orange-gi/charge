@@ -36,7 +36,7 @@ echo "🗄️  初始化数据库..."
 python3 -c "from database import init_db; init_db()" || echo "⚠️  数据库初始化失败，请检查数据库连接"
 
 echo "🚀 启动后端服务..."
-nohup uvicorn main:app --reload --host 127.0.0.1 --port 8000 > ../backend.log 2>&1 &
+nohup uvicorn main:app --reload --host 0.0.0.0 --port 8000 > ../backend.log 2>&1 &
 BACKEND_PID=$!
 echo $BACKEND_PID > ../backend.pid
 echo "✅ 后端已启动 (PID: $BACKEND_PID)"
@@ -52,7 +52,7 @@ if [ ! -d "node_modules" ]; then
 fi
 
 echo "🚀 启动前端服务..."
-nohup pnpm dev --host 127.0.0.1 --port 3000 > ../frontend.log 2>&1 &
+nohup pnpm dev --host 0.0.0.0 --port 3000 > ../frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo $FRONTEND_PID > ../frontend.pid
 echo "✅ 前端已启动 (PID: $FRONTEND_PID)"
@@ -60,4 +60,4 @@ echo "✅ 前端已启动 (PID: $FRONTEND_PID)"
 echo ""
 echo "🎉 服务启动完成！"
 echo "  - 前端: http://localhost:3000"
-echo "  - 后端: http://127.0.0.1:8000"
+echo "  - 后端: http://127.0.0.1:8000（远程访问请用 http://<服务器IP>:8000）"

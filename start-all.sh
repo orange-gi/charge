@@ -44,7 +44,7 @@ if [ ! -f ".env" ]; then
     cat > .env << 'ENVEOF'
 DEBUG=true
 ENVIRONMENT=development
-HOST=127.0.0.1
+HOST=0.0.0.0
 PORT=8000
 RELOAD=true
 DATABASE_URL=postgresql://postgres:password@localhost:5432/charge_analysis
@@ -65,6 +65,8 @@ OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 TRAINING_WORKERS=4
 MAX_TRAINING_TIME=3600
+# 远程部署建议把这里改成你的前端地址，例如：
+# ALLOWED_ORIGINS=http://<服务器IP>:3000
 ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
 LOG_LEVEL=INFO
 LOG_FILE=
@@ -105,7 +107,7 @@ python3 -c "from database import init_db; init_db()" 2>/dev/null || {
 
 # 启动后端（后台）
 echo "🚀 启动后端服务..."
-nohup uvicorn main:app --reload --host 127.0.0.1 --port 8000 > ../backend.log 2>&1 &
+nohup uvicorn main:app --reload --host 0.0.0.0 --port 8000 > ../backend.log 2>&1 &
 BACKEND_PID=$!
 echo $BACKEND_PID > ../backend.pid
 echo -e "${GREEN}✅ 后端服务已启动 (PID: $BACKEND_PID)${NC}"
@@ -121,7 +123,8 @@ cd ../charge-analysis-frontend
 
 if [ ! -f ".env.local" ]; then
     echo -e "${YELLOW}⚠️  前端 .env.local 文件不存在，正在创建...${NC}"
-    echo "VITE_API_BASE_URL=http://localhost:8000" > .env.local
+    # 留空让前端自动推断：当前 hostname + :8000（远程部署更安全）
+    echo "VITE_API_BASE_URL=" > .env.local
     echo -e "${GREEN}✅ .env.local 文件已创建${NC}"
 fi
 
@@ -141,7 +144,7 @@ fi
 
 # 启动前端（后台）
 echo "🚀 启动前端服务..."
-nohup pnpm dev --host 127.0.0.1 --port 3000 > ../frontend.log 2>&1 &
+nohup pnpm dev --host 0.0.0.0 --port 3000 > ../frontend.log 2>&1 &
 FRONTEND_PID=$!
 echo $FRONTEND_PID > ../frontend.pid
 echo -e "${GREEN}✅ 前端服务已启动 (PID: $FRONTEND_PID)${NC}"
@@ -177,8 +180,8 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo "📱 访问地址："
 echo "   - 前端: http://localhost:3000"
-echo "   - 后端 API: http://127.0.0.1:8000"
-echo "   - API 文档: http://127.0.0.1:8000/docs"
+echo "   - 后端 API: http://127.0.0.1:8000（远程访问请用 http://<服务器IP>:8000）"
+echo "   - API 文档: http://127.0.0.1:8000/docs（远程访问请用 http://<服务器IP>:8000/docs）"
 echo ""
 echo "📋 管理命令："
 echo "   - 查看后端日志: tail -f backend.log"
