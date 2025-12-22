@@ -40,6 +40,14 @@ export interface AvailableSignalsResponse {
   totalCount: number;
 }
 
+export interface DbcConfigInfo {
+  configured: boolean;
+  filename?: string;
+  uploadedAt?: string;
+  fileSize?: number | null;
+  fileMtime?: string | null;
+}
+
 interface BackendAnalysis {
   id: number;
   name: string;
@@ -102,6 +110,34 @@ export const chargingService = {
     return {
       signals: data.signals || data.signal_infos || [],
       totalCount: data.total_count || data.totalCount || 0
+    };
+  },
+
+  async getCurrentDbc(token: string): Promise<DbcConfigInfo> {
+    const data = await apiRequest<any>('/api/analyses/dbc/current', { token });
+    return {
+      configured: Boolean(data.configured),
+      filename: data.filename,
+      uploadedAt: data.uploaded_at || data.uploadedAt,
+      fileSize: data.file_size ?? data.fileSize ?? null,
+      fileMtime: data.file_mtime ?? data.fileMtime ?? null
+    };
+  },
+
+  async uploadDbc(file: File, token: string): Promise<DbcConfigInfo> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const data = await apiRequest<any>('/api/analyses/dbc/upload', {
+      method: 'POST',
+      token,
+      body: formData
+    });
+    return {
+      configured: Boolean(data.configured),
+      filename: data.filename,
+      uploadedAt: data.uploaded_at || data.uploadedAt,
+      fileSize: data.file_size ?? data.fileSize ?? null,
+      fileMtime: data.file_mtime ?? data.fileMtime ?? null
     };
   },
 

@@ -223,30 +223,15 @@ class MessageParsingNode:
     """报文解析节点 - 基于 DBC 文件解析 CAN 日志"""
     
     def __init__(self):
-        # 关键信号列表（GBT 27930-2015 标准中的充电相关信号）
-        # 注意：实际信号名称可能因 DBC 文件而异，这里使用通用关键词匹配
-        # 系统会自动根据 DBC 文件中实际存在的信号进行匹配
+        # 关键信号关键词（GBT 27930-2015 标准中的充电相关信号）
+        # 注意：实际信号名称可能因 DBC 文件而异，这里使用通用关键词匹配；
+        # 真正的 filter_signals 会在 process() 中基于“当前用户配置的 DBC”动态计算。
         self.filter_keywords = [
             'BMS', 'Chrg', 'SOC', 'Batt',      # 电池管理系统相关
             'Current', 'Voltage', 'Temp',      # 电气参数
             'State', 'Ready', 'Connect',       # 状态信息
             'Output', 'Max', 'Min',            # 输出参数
         ]
-        
-        # 初始化 CAN 解析器并获取实际可用的信号
-        from services.can_parser import CANLogParser
-        # DBC 文件位于 services 目录下，使用相对路径
-        # 如果 CANLogParser 未指定路径，它会自动查找默认位置
-        self.can_parser = CANLogParser()  # 使用默认路径
-        
-        # 根据关键词过滤出实际存在的信号
-        all_signals = self.can_parser.get_available_signals()
-        self.filter_signals = [
-            sig for sig in all_signals 
-            if any(keyword.lower() in sig.lower() for keyword in self.filter_keywords)
-        ]
-        
-        logger.info(f"已加载 {len(self.filter_signals)} 个充电相关信号用于分析")
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理报文解析"""
@@ -256,6 +241,21 @@ class MessageParsingNode:
         try:
             if state.get('progress_callback'):
                 await state['progress_callback']("报文解析", 15, "开始解析 CAN 日志...")
+
+            # 解析当前用户使用的 DBC（如果未配置则回退到默认 DBC）
+            user_id = int(state.get("user_id") or 0)
+            from services.can_parser import CANLogParser
+            from services.dbc_config import resolve_user_dbc_path
+
+            dbc_path = resolve_user_dbc_path(user_id) if user_id else None
+            can_parser = CANLogParser(dbc_file_path=dbc_path) if dbc_path else CANLogParser()
+            logger.info(
+                "报文解析准备完成 analysis_id=%s user_id=%s file=%s dbc=%s",
+                state.get("analysis_id"),
+                user_id,
+                file_path,
+                dbc_path or str(can_parser.dbc_file_path),
+            )
             
             # 获取用户选择的信号列表，如果未指定则使用默认过滤信号
             selected_signals = state.get('selected_signals')
@@ -264,16 +264,29 @@ class MessageParsingNode:
                 filter_signals = selected_signals
                 logger.info(f"使用用户选择的 {len(filter_signals)} 个信号进行解析")
             else:
-                # 使用默认的过滤信号列表
-                filter_signals = self.filter_signals
-                logger.info(f"使用默认的 {len(filter_signals)} 个充电相关信号进行解析")
+                # 使用默认的过滤信号列表（基于当前 DBC 动态匹配）
+                all_signals = can_parser.get_available_signals()
+                filter_signals = [
+                    sig
+                    for sig in all_signals
+                    if any(keyword.lower() in sig.lower() for keyword in self.filter_keywords)
+                ]
+                logger.info(
+                    "使用默认过滤信号进行解析 keyword_count=%s matched_signals=%s total_signals_in_dbc=%s",
+                    len(self.filter_keywords),
+                    len(filter_signals),
+                    len(all_signals),
+                )
+                if not filter_signals:
+                    logger.warning("默认关键词未匹配到任何信号，将解析全部信号（可能较慢）")
+                    filter_signals = None
             
             # 检查文件类型
             file_ext = Path(file_path).suffix.lower()
             
             if file_ext == '.blf':
                 # 使用 CAN 解析器解析 BLF 文件（高性能版本）
-                df_parsed = await self.can_parser.parse_blf(
+                df_parsed = await can_parser.parse_blf(
                     file_path,
                     filter_signals=filter_signals,
                     progress_callback=state.get('progress_callback')
@@ -305,11 +318,13 @@ class MessageParsingNode:
                 'parsed_data_records': parsed_records,
                 'data_stats': stats,
                 'parsing_status': 'completed',
-                'dbc_signals': self.can_parser.get_available_signals()
+                'dbc_signals': can_parser.get_available_signals(),
+                'dbc_file_used': dbc_path or str(can_parser.dbc_file_path),
             }
             mark_node_completed(result_state, "message_parsing", {
                 "records": len(parsed_records),
-                "signal_count": stats.get('signal_count', 0)
+                "signal_count": stats.get('signal_count', 0),
+                "dbc": result_state.get("dbc_file_used"),
             })
             return result_state
             
