@@ -1,6 +1,6 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
-import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag } from 'antd';
+import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Modal, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import { useAuthStore } from './stores/authStore';
@@ -2426,25 +2426,62 @@ const RAGPage = () => {
       return;
     }
 
-    try {
+    const lowerName = uploadFile.name.toLowerCase();
+    if (!lowerName.endsWith('.xlsx') && !lowerName.endsWith('.xlsm')) {
+      message.warning('当前仅支持上传 Excel（.xlsx/.xlsm）');
+      return;
+    }
+
+    const doUpload = async (overwrite: boolean) => {
       message.loading('上传中...', 0);
       const { ragService } = await import('./services/ragService');
-      
-      await ragService.uploadDocument(collectionId, uploadFile, token);
-      
+      await ragService.uploadDocument(collectionId, uploadFile, token, { overwrite });
       message.destroy();
-      message.success('文档上传成功');
+      message.success(overwrite ? '覆盖并重建索引成功' : '文档上传成功');
       setUploadFile(null);
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
-      
-      // Reload documents
       loadDocuments(collectionId);
-    } catch (error: any) {
-      message.destroy();
-      message.error(error.message || '上传失败');
-    }
+    };
+
+    Modal.confirm({
+      title: '上传提示',
+      content: '系统将默认使用「第一个 Sheet 的第一列」作为增强检索标签（例如停充码表的“停充码”列），用于严格等值命中与结果解释。是否继续上传？',
+      okText: '继续上传',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await doUpload(false);
+        } catch (error: any) {
+          message.destroy();
+          const msg = error?.message || '上传失败';
+          // 后端 409：同名覆盖确认
+          if (msg.includes('同名文档已存在') || msg.includes('确认覆盖')) {
+            return new Promise<void>((resolve, reject) => {
+              Modal.confirm({
+                title: '发现同名文档',
+                content: '该知识库中已存在同名 Excel。继续将覆盖并重建向量索引（历史索引会被删除）。是否确认覆盖？',
+                okText: '确认覆盖',
+                cancelText: '取消',
+                onOk: async () => {
+                  try {
+                    await doUpload(true);
+                    resolve();
+                  } catch (e) {
+                    message.destroy();
+                    message.error((e as any)?.message || '覆盖失败');
+                    reject(e);
+                  }
+                },
+                onCancel: () => resolve()
+              });
+            });
+          }
+          message.error(msg);
+        }
+      }
+    });
   };
 
   return (
@@ -2613,15 +2650,28 @@ const RAGPage = () => {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.doc,.docx,.txt"
-            onChange={(e) => e.target.files && setUploadFile(e.target.files[0])}
+            accept=".xlsx,.xlsm"
+            onChange={(e) => {
+              const f = e.target.files?.[0] || null;
+              if (!f) return;
+              const lower = f.name.toLowerCase();
+              if (!lower.endsWith('.xlsx') && !lower.endsWith('.xlsm')) {
+                message.warning('当前仅支持上传 Excel（.xlsx/.xlsm）');
+                if (fileInputRef.current) {
+                  fileInputRef.current.value = '';
+                }
+                setUploadFile(null);
+                return;
+              }
+              setUploadFile(f);
+            }}
             style={{ display: 'none' }}
           />
           <Button 
             size="large" 
             onClick={() => fileInputRef.current?.click()}
           >
-            选择文档
+            选择 Excel
           </Button>
           {uploadFile && (
             <div style={{ marginTop: '16px' }}>
@@ -2632,12 +2682,12 @@ const RAGPage = () => {
                 onClick={handleUploadDocument}
                 style={{ marginTop: '12px' }}
               >
-                上传文档
+                上传并索引
               </Button>
             </div>
           )}
           <p style={{ marginTop: '16px', fontSize: '12px', color: '#999' }}>
-            支持PDF、Word、TXT格式，文件大小不超过10MB
+            仅支持 Excel（.xlsx/.xlsm）。默认只处理第一个 Sheet，并使用第一列做增强检索（严格等值命中）。
           </p>
         </div>
       </div>

@@ -246,10 +246,17 @@ class AnalysisListResponse(BaseModel):
 class RagQueryRequest(BaseModel):
     collection_id: int
     query: str = Field(min_length=1, max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=50, description="返回的命中条目数量")
+    show_retrieval: bool = Field(default=True, description="是否返回检索命中明细（证据链）")
 
     model_config = ConfigDict(
         json_schema_extra={
-            "example": {"collection_id": 12, "query": "直流桩电压波动超标如何处理？"}
+            "example": {
+                "collection_id": 12,
+                "query": "停充码1001代表什么含义？",
+                "top_k": 5,
+                "show_retrieval": True,
+            }
         }
     )
 
