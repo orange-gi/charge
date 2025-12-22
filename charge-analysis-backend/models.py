@@ -181,7 +181,9 @@ class KnowledgeDocument(Base):
     filename = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=False)
     file_size = Column(BigInteger)
-    file_type = Column(String(50))
+    # MIME type（例如 application/pdf、application/vnd.openxmlformats-officedocument.spreadsheetml.sheet）
+    # 50 不够用，会导致 PostgreSQL varchar 截断报错
+    file_type = Column(String(255))
     content = Column(Text)
     chunk_count = Column(Integer, default=0)
     meta_info = Column(Text)  # JSON 数据
