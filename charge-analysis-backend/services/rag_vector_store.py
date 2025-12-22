@@ -27,12 +27,24 @@ class ChromaVectorStore:
         # 延迟 import，避免在应用启动阶段因为依赖冲突直接崩溃。
         # 典型冲突：chromadb==0.4.x 在 NumPy 2.x 下会触发 `np.float_ was removed`。
         try:
+            # ---- NumPy 2.x 兼容补丁（不改依赖版本）----
+            # chromadb==0.4.x 的部分代码仍引用 np.float_（在 NumPy 2.0 被移除）。
+            # 这里在导入 chromadb 前补回别名，避免 import 阶段直接崩溃。
+            import numpy as np  # type: ignore
+
+            if not hasattr(np, "float_"):  # NumPy 2.x
+                # 将 float_ 映射到 float64，满足旧依赖对名称的引用
+                setattr(np, "float_", np.float64)
+            # 某些旧代码可能引用 np.uint（确保存在）
+            if not hasattr(np, "uint"):
+                setattr(np, "uint", np.uint64)
+
             import chromadb  # type: ignore
         except Exception as e:
             msg = (
                 "Chroma 向量库不可用：导入 chromadb 失败。"
                 "如果你看到 `np.float_ was removed`，说明当前 chromadb 版本与 NumPy 2.x 不兼容。"
-                "请升级 chromadb，或将 RAG 功能放到独立环境。"
+                "可选方案：升级 chromadb；或保持旧版本并在导入前做 numpy 兼容补丁；或将 RAG 功能放到独立环境。"
             )
             logger.error("%s 原始错误: %s", msg, e)
             raise VectorStoreUnavailableError(msg) from e
