@@ -43,7 +43,11 @@ PyYAML==6.0.2
 
 # Data processing
 pandas==2.3.3
-numpy>=1.26.2,<3.0.0
+# 依赖约束说明（务必一起看）：
+# - chromadb==0.4.x 在 NumPy 2.x 下会在 import 阶段崩溃（典型报错：np.float_ removed）
+# - asammdf==8.6.0+ 强制要求 NumPy>=2.0.0
+# 因此本项目固定 NumPy 为 <2，并将 asammdf 限定到仍支持 NumPy<2 的版本线。
+numpy>=1.26.2,<2.0.0
 scipy>=1.11.4
 
 # HTTP and networking
@@ -59,7 +63,8 @@ python-docx==1.1.0
 
 # CAN bus analysis
 cantools==39.4.1
-asammdf==8.6.0
+# 8.6.0+ 需要 numpy>=2，和本项目（为兼容 chromadb==0.4.x）固定的 numpy<2 冲突
+asammdf==8.5.5
 
 # Utilities
 loguru==0.7.2
