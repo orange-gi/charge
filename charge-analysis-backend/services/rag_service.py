@@ -22,7 +22,7 @@ from database import session_scope
 from models import KnowledgeCollection, KnowledgeDocument, RAGQuery
 from services.rag_cache import HybridCache
 from services.rag_normalize import extract_candidate_primary_tag, normalize_primary_tag_value, normalize_text
-from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts
+from services.rag_vector_store import ChromaVectorStore, VectorHit, VectorStoreUnavailableError, embed_query, embed_texts
 
 
 class DocumentAlreadyExistsError(RuntimeError):
@@ -45,7 +45,19 @@ class RagService:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._cache = HybridCache(self._settings.redis_url)
-        self._vector = ChromaVectorStore()
+        # 允许在 chromadb 与 numpy 冲突时降级（服务可启动，RAG 功能返回明确错误）
+        try:
+            self._vector = ChromaVectorStore()
+            self._vector_available = True
+            self._vector_unavailable_reason = ""
+        except VectorStoreUnavailableError as e:
+            self._vector = None
+            self._vector_available = False
+            self._vector_unavailable_reason = str(e)
+
+    def _ensure_vector_available(self) -> None:
+        if not getattr(self, "_vector_available", False) or self._vector is None:
+            raise ValueError(self._vector_unavailable_reason or "向量库不可用")
 
     def create_collection(self, name: str, description: str | None, user_id: int) -> KnowledgeCollection:
         with session_scope() as session:
@@ -65,6 +77,7 @@ class RagService:
             session.add(collection)
             session.refresh(collection)
             # 确保 Chroma collection 存在
+            self._ensure_vector_available()
             self._vector.get_or_create_collection(collection.chroma_collection_id)
             return collection
 
@@ -116,6 +129,7 @@ class RagService:
             session.add(collection)
             session.refresh(collection)
 
+        self._ensure_vector_available()
         self._vector.get_or_create_collection(collection.chroma_collection_id)
         return collection
 
@@ -225,6 +239,7 @@ class RagService:
             session.flush()
             session.refresh(collection)
             chroma_id = collection.chroma_collection_id
+        self._ensure_vector_available()
         self._vector.get_or_create_collection(chroma_id)
         return chroma_id
 

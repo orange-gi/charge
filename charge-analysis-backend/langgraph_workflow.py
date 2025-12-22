@@ -560,10 +560,8 @@ class RAGRetrievalNode:
     """RAG检索节点"""
     
     def __init__(self):
-        # 复用后端真实 RAG 服务（Chroma 检索）
-        from services.rag_service import get_rag_service
-
-        self._rag_service = get_rag_service()
+        # 延迟加载：避免启动阶段因 chromadb/numpy 冲突导致服务崩溃
+        self._rag_service = None
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理RAG检索"""
@@ -574,6 +572,10 @@ class RAGRetrievalNode:
         try:
             if state.get('progress_callback'):
                 await state['progress_callback']("知识检索", 70, "RAG知识检索中...")
+
+            if self._rag_service is None:
+                from services.rag_service import get_rag_service
+                self._rag_service = get_rag_service()
             
             # 构建检索查询
             query = self._build_retrieval_query(problem_direction, df)

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-import chromadb
-try:
-    # 新版本 chromadb 可能调整了内部模块结构；类型注解不应阻塞运行
-    from chromadb.api.models.Collection import Collection  # type: ignore
-except Exception:  # pragma: no cover
-    Collection = Any  # type: ignore
-
 from config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class VectorStoreUnavailableError(RuntimeError):
+    """向量库不可用（例如依赖冲突导致 chromadb 无法 import）。"""
 
 
 @dataclass(frozen=True)
@@ -24,10 +24,24 @@ class VectorHit:
 
 class ChromaVectorStore:
     def __init__(self) -> None:
+        # 延迟 import，避免在应用启动阶段因为依赖冲突直接崩溃。
+        # 典型冲突：chromadb==0.4.x 在 NumPy 2.x 下会触发 `np.float_ was removed`。
+        try:
+            import chromadb  # type: ignore
+        except Exception as e:
+            msg = (
+                "Chroma 向量库不可用：导入 chromadb 失败。"
+                "如果你看到 `np.float_ was removed`，说明当前 chromadb 版本与 NumPy 2.x 不兼容。"
+                "请升级 chromadb，或将 RAG 功能放到独立环境。"
+            )
+            logger.error("%s 原始错误: %s", msg, e)
+            raise VectorStoreUnavailableError(msg) from e
+
         settings = get_settings()
+        self._chromadb = chromadb
         self._client = chromadb.PersistentClient(path=str(settings.chroma_persist_directory))
 
-    def get_or_create_collection(self, chroma_collection_id: str) -> Collection:
+    def get_or_create_collection(self, chroma_collection_id: str):
         try:
             return self._client.get_collection(name=chroma_collection_id)
         except Exception:
