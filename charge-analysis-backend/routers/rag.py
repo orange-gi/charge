@@ -1,8 +1,7 @@
 """知识库（RAG）API。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status
-from io import BytesIO
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
 
 from core.dependencies import get_current_user
 from models import User, UserRole
@@ -14,9 +13,8 @@ from schemas import (
     RagQueryRequest,
     RagQueryResponse,
 )
-from PyPDF2 import PdfReader
 
-from services.rag_service import get_rag_service
+from services.rag_service import DocumentAlreadyExistsError, get_rag_service
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 rag_service = get_rag_service()
@@ -54,55 +52,36 @@ def get_collection(collection_id: int, user: User = Depends(get_current_user)) -
 async def upload_document(
     collection_id: int,
     file: UploadFile = File(...),
+    overwrite: bool = Form(False),
     user: User = Depends(get_current_user),
 ) -> KnowledgeDocumentRead:
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
-    try:
-        content = _extract_text_from_upload(file, raw_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    filename = file.filename or "upload.xlsx"
+    lower = filename.lower()
+    if not (lower.endswith(".xlsx") or lower.endswith(".xlsm")):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前仅支持上传 Excel（.xlsx/.xlsm）")
 
     try:
-        document = rag_service.add_document_from_text(
+        document, _report = rag_service.add_excel_document(
             collection_id=collection_id,
-            filename=file.filename,
-            content=content,
+            filename=filename,
             file_size=len(raw_bytes),
-            file_type=file.content_type or "txt",
+            file_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             user_id=user.id,
+            raw_bytes=raw_bytes,
+            overwrite=overwrite,
         )
+    except DocumentAlreadyExistsError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        # collection 不存在 -> 404；其它解析错误 -> 400
+        msg = str(exc)
+        if "知识库不存在" in msg:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg) from exc
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg) from exc
     return KnowledgeDocumentRead.model_validate(document)
-
-
-def _extract_text_from_upload(file: UploadFile, raw_bytes: bytes) -> str:
-    filename = (file.filename or "").lower()
-    content_type = (file.content_type or "").lower()
-
-    if filename.endswith(".pdf") or content_type == "application/pdf":
-        try:
-            reader = PdfReader(BytesIO(raw_bytes))
-        except Exception as exc:  # PyPDF2 内部会抛出多种异常
-            raise ValueError("无法解析 PDF 文件") from exc
-        pages_text: list[str] = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            if text:
-                pages_text.append(text)
-        if not pages_text:
-            raise ValueError("PDF 中未提取到可用文本")
-        return "\n".join(pages_text)
-
-    if b"\x00" in raw_bytes:
-        raise ValueError("文件包含不可处理的二进制内容，请提供文本格式")
-
-    try:
-        return raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw_bytes.decode("utf-8", errors="ignore")
 
 
 @router.get("/collections/{collection_id}/documents", response_model=list[KnowledgeDocumentRead])
@@ -139,5 +118,11 @@ def query_knowledge(
     ),
     user: User = Depends(get_current_user),
 ) -> RagQueryResponse:
-    result = rag_service.query(payload.collection_id, payload.query, user.id)
+    result = rag_service.query(
+        payload.collection_id,
+        payload.query,
+        user_id=user.id,
+        limit=getattr(payload, "top_k", 5) or 5,
+        show_retrieval=getattr(payload, "show_retrieval", True),
+    )
     return RagQueryResponse(**result)

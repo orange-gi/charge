@@ -545,7 +545,10 @@ class RAGRetrievalNode:
     """RAG检索节点"""
     
     def __init__(self):
-        self.vector_store = None  # 实际使用时需要初始化ChromaDB客户端
+        # 复用后端真实 RAG 服务（Chroma 检索）
+        from services.rag_service import get_rag_service
+
+        self._rag_service = get_rag_service()
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理RAG检索"""
@@ -559,11 +562,22 @@ class RAGRetrievalNode:
             
             # 构建检索查询
             query = self._build_retrieval_query(problem_direction, df)
-            
-            # 检索相关文档
-            documents = await self._retrieve_documents(query)
-            
-            # 构建上下文
+            # 选择默认知识库（与 RAG 管理页一致：优先用户库，否则公共库）
+            user_id = state.get("user_id")
+            if not user_id:
+                raise ValueError("缺少 user_id，无法选择知识库")
+
+            collection = await asyncio.to_thread(self._rag_service.get_or_create_default_collection_for_user, int(user_id))
+            # 检索相关条目（检索-only，返回证据链）
+            result = await asyncio.to_thread(
+                self._rag_service.query,
+                collection.id,
+                query,
+                int(user_id),
+                5,
+                True,
+            )
+            documents = result.get("documents") or []
             context = self._build_context(documents)
             
             if state.get('progress_callback'):
@@ -612,32 +626,17 @@ class RAGRetrievalNode:
         
         return base_query
     
-    async def _retrieve_documents(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """检索文档"""
-        # 模拟检索过程
-        await asyncio.sleep(0.5)
-        
-        # 返回模拟文档
-        mock_documents = [
-            {
-                'content': f'关于{query}的技术文档内容，包括故障诊断和处理方法。',
-                'metadata': {'source': '技术手册.pdf', 'category': 'troubleshooting'},
-                'score': 0.89
-            },
-            {
-                'content': f'{query}相关的最佳实践和解决方案。',
-                'metadata': {'source': '操作指南.docx', 'category': 'guide'},
-                'score': 0.76
-            }
-        ]
-        
-        return mock_documents
-    
     def _build_context(self, documents: List[Dict[str, Any]]) -> str:
         """构建上下文"""
         context_parts = []
         for doc in documents:
-            context_parts.append(f"[{doc['score']:.3f}] {doc['content']}")
+            score = doc.get("score") or 0.0
+            content = doc.get("content") or doc.get("snippet") or ""
+            meta = doc.get("metadata") or {}
+            src = doc.get("filename") or meta.get("source_filename") or "未知来源"
+            row = doc.get("row_index") or meta.get("row_index")
+            row_part = f"@{row}" if row is not None else ""
+            context_parts.append(f"[{float(score):.3f}] {src}{row_part} {content}")
         return "\n\n".join(context_parts)
 
 

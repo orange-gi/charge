@@ -109,9 +109,17 @@ export const ragService = {
     return data.map(transformDocumentData);
   },
 
-  async uploadDocument(collectionId: number, file: File, token: string): Promise<KnowledgeDocument> {
+  async uploadDocument(
+    collectionId: number,
+    file: File,
+    token: string,
+    options?: { overwrite?: boolean }
+  ): Promise<KnowledgeDocument> {
     const formData = new FormData();
     formData.append('file', file);
+    if (options?.overwrite) {
+      formData.append('overwrite', 'true');
+    }
 
     const data = await apiRequest<BackendDocument>(`/api/rag/collections/${collectionId}/documents`, {
       method: 'POST',
