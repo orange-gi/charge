@@ -5,7 +5,11 @@ from functools import lru_cache
 from typing import Any
 
 import chromadb
-from chromadb.api.models.Collection import Collection
+try:
+    # 新版本 chromadb 可能调整了内部模块结构；类型注解不应阻塞运行
+    from chromadb.api.models.Collection import Collection  # type: ignore
+except Exception:  # pragma: no cover
+    Collection = Any  # type: ignore
 
 from config import get_settings
 

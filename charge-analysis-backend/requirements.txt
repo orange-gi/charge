@@ -23,7 +23,12 @@ langgraph==1.0.0
 langchain-core==1.0.1
 
 # Vector database and embeddings
-chromadb==0.4.18
+#
+# NOTE:
+# - asammdf==8.6.0 需要 numpy>=2
+# - chromadb==0.4.x 与 numpy 2.x 不兼容（会触发 np.float_ 已移除的异常）
+# 因此将 chromadb 升级到 0.6.x（兼容 numpy 2.x）
+chromadb==0.6.3
 sentence-transformers==3.0.1
 
 # Machine Learning
@@ -43,8 +48,8 @@ PyYAML==6.0.2
 
 # Data processing
 pandas==2.3.3
-# chromadb==0.4.18 与 NumPy 2.x 不兼容（会触发 np.float_ 已移除的异常），因此固定到 NumPy < 2
-numpy>=1.26.2,<2.0.0
+# asammdf>=8.6.0 需要 numpy>=2
+numpy>=2.0.0,<3.0.0
 scipy>=1.11.4
 
 # HTTP and networking
