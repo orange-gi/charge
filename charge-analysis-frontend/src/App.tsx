@@ -467,9 +467,67 @@ const ChargingPage = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [selectedStep, setSelectedStep] = React.useState<string | null>(null);
   const [analysisData, setAnalysisData] = React.useState<any>(null);
+  const [dbcModalOpen, setDbcModalOpen] = React.useState(false);
+  const [dbcFile, setDbcFile] = React.useState<File | null>(null);
+  const [dbcUploading, setDbcUploading] = React.useState(false);
+  const [dbcInfo, setDbcInfo] = React.useState<any>(null);
+  const [loadingDbcInfo, setLoadingDbcInfo] = React.useState(false);
   const { user, token } = useAuthStore();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const dbcFileInputRef = React.useRef<HTMLInputElement>(null);
   const workflowTrace = analysisData?.workflow_trace || {};
+
+  const loadDbcInfo = React.useCallback(async () => {
+    if (!token) return;
+    setLoadingDbcInfo(true);
+    try {
+      const { chargingService } = await import('./services/chargingService');
+      const info = await chargingService.getCurrentDbc(token);
+      setDbcInfo(info);
+    } catch (e: any) {
+      // 不影响主流程：静默失败，仅在控制台记录
+      console.warn('加载 DBC 配置失败:', e);
+    } finally {
+      setLoadingDbcInfo(false);
+    }
+  }, [token]);
+
+  React.useEffect(() => {
+    loadDbcInfo();
+  }, [loadDbcInfo]);
+
+  const handleUploadDbc = async () => {
+    if (!token) {
+      message.warning('请先登录');
+      return;
+    }
+    if (!dbcFile) {
+      message.warning('请选择 .dbc 文件');
+      return;
+    }
+    if (!dbcFile.name.toLowerCase().endsWith('.dbc')) {
+      message.warning('仅支持 .dbc 文件');
+      return;
+    }
+
+    setDbcUploading(true);
+    try {
+      message.loading({ content: '正在上传 DBC...', key: 'dbcUpload' });
+      const { chargingService } = await import('./services/chargingService');
+      const info = await chargingService.uploadDbc(dbcFile, token);
+      setDbcInfo(info);
+      message.success({ content: 'DBC 配置成功，后续解析将使用该 DBC', key: 'dbcUpload' });
+      setDbcModalOpen(false);
+      setDbcFile(null);
+      if (dbcFileInputRef.current) {
+        dbcFileInputRef.current.value = '';
+      }
+    } catch (e: any) {
+      message.error({ content: e?.message || '上传 DBC 失败', key: 'dbcUpload' });
+    } finally {
+      setDbcUploading(false);
+    }
+  };
 
   const formatDateTime = (value?: string) => {
     if (!value) return '--';
@@ -981,6 +1039,57 @@ const ChargingPage = () => {
 
   return (
     <AntLayout style={{ background: '#fff' }}>
+      <Modal
+        title="配置DBC（用于报文解析）"
+        open={dbcModalOpen}
+        onCancel={() => {
+          setDbcModalOpen(false);
+          setDbcFile(null);
+          if (dbcFileInputRef.current) {
+            dbcFileInputRef.current.value = '';
+          }
+        }}
+        okText="上传并启用"
+        cancelText="取消"
+        onOk={handleUploadDbc}
+        okButtonProps={{ loading: dbcUploading, disabled: !dbcFile }}
+        destroyOnClose
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <div style={{ fontSize: '13px', color: '#595959' }}>
+            当前解析会优先使用你上传配置的 DBC（按用户生效）。如果未配置，则回退到系统内置 DBC。
+          </div>
+
+          <div style={{ padding: '10px 12px', background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: '8px' }}>
+            {loadingDbcInfo ? (
+              <Spin size="small" />
+            ) : dbcInfo?.configured ? (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                <Tag color="black">已配置</Tag>
+                <span style={{ fontWeight: 500 }}>{dbcInfo.filename || '-'}</span>
+                {dbcInfo.uploadedAt && <span style={{ color: '#8c8c8c' }}>上传时间：{dbcInfo.uploadedAt}</span>}
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <Tag>未配置</Tag>
+                <span style={{ color: '#8c8c8c' }}>当前使用系统默认 DBC</span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <input
+              ref={dbcFileInputRef}
+              type="file"
+              accept=".dbc"
+              onChange={(e) => setDbcFile(e.target.files?.[0] || null)}
+            />
+            <div style={{ marginTop: '8px', fontSize: '12px', color: '#8c8c8c' }}>
+              提示：建议使用与日志采集一致的 DBC；若解析仍为空，请把后端日志中“首帧采样/未定义CAN ID/解码错误采样”贴出来排查。
+            </div>
+          </div>
+        </div>
+      </Modal>
       {/* 侧边栏 - 历史分析记录 */}
       <Sider 
         width={sidebarCollapsed ? 80 : 280} 
@@ -1120,6 +1229,32 @@ const ChargingPage = () => {
             />
           </div>
           
+          {/* 配置DBC按钮（优先使用用户上传的 DBC 解析） */}
+          <Button
+            block
+            size="large"
+            onClick={() => {
+              setDbcModalOpen(true);
+              // 打开弹窗时刷新一次状态（避免多端/多页面操作后不同步）
+              loadDbcInfo();
+            }}
+            style={{
+              height: '44px',
+              borderRadius: '8px',
+              border: '1px solid #1a1a1a',
+              background: '#1a1a1a',
+              color: 'white',
+              fontWeight: '400',
+              marginBottom: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '8px'
+            }}
+          >
+            配置DBC
+          </Button>
+
           {/* 新建分析按钮 */}
           <Button
             block
@@ -1130,6 +1265,8 @@ const ChargingPage = () => {
               setStatus('idle');
               setResults([]);
               setSelectedSignals([]);
+              // 新建分析时也刷新一次 DBC 信息，便于用户确认解析来源
+              loadDbcInfo();
               setAnalysisProgress(0);
               setProgressMessage('');
               if (fileInputRef.current) {

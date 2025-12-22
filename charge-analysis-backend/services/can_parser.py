@@ -60,9 +60,27 @@ class CANLogParser:
             if not self.dbc_file_path.exists():
                 raise FileNotFoundError(f"DBC 文件不存在: {self.dbc_file_path}")
             
-            logger.info(f"加载 DBC 文件: {self.dbc_file_path}")
+            try:
+                stat = self.dbc_file_path.stat()
+                logger.info(
+                    "加载 DBC 文件: %s (size=%s bytes mtime=%s)",
+                    self.dbc_file_path,
+                    stat.st_size,
+                    stat.st_mtime,
+                )
+            except Exception:
+                logger.info("加载 DBC 文件: %s", self.dbc_file_path)
             self.db = cantools.database.load_file(str(self.dbc_file_path))
-            logger.info(f"DBC 文件加载成功，包含 {len(self.db.messages)} 个消息定义")
+            try:
+                # 统计信号数（用于排查“DBC 加载了但是没信号/消息”的问题）
+                signal_count = sum(len(m.signals) for m in self.db.messages)
+            except Exception:
+                signal_count = -1
+            logger.info(
+                "DBC 文件加载成功: messages=%s signals=%s",
+                len(self.db.messages),
+                signal_count,
+            )
             
             # 性能优化：预先构建映射
             self._build_performance_mappings()
@@ -140,6 +158,7 @@ class CANLogParser:
         try:
             with open(file_path, 'rb') as f:
                 header = f.read(16)
+            logger.info("BLF header bytes=%s", header.hex())
                 
             # Vector BLF 格式: 以 "LOGG" 开头
             if header.startswith(b'LOGG'):
@@ -214,6 +233,9 @@ class CANLogParser:
             decoded_count = 0
             skipped_count = 0
             error_count = 0
+            unknown_id_samples: Dict[int, int] = {}
+            decode_error_samples: List[Dict[str, Any]] = []
+            first_frame_samples: List[Dict[str, Any]] = []
             last_progress_time = asyncio.get_event_loop().time()
             parse_start_time = asyncio.get_event_loop().time()
             
@@ -223,6 +245,17 @@ class CANLogParser:
             for msg in log:
                 try:
                     can_id = msg.arbitration_id
+                    # 采样前几帧，便于排查“文件里根本没有目标 ID/数据”这类问题
+                    if len(first_frame_samples) < 10:
+                        first_frame_samples.append(
+                            {
+                                "can_id": int(can_id),
+                                "can_id_hex": f"0x{can_id:X}",
+                                "dlc": int(getattr(msg, "dlc", 0) or 0),
+                                "data_hex": bytes(msg.data).hex() if getattr(msg, "data", None) is not None else "",
+                                "timestamp": float(getattr(msg, "timestamp", 0.0) or 0.0),
+                            }
+                        )
                     
                     # 性能优化：如果指定了目标消息ID，快速跳过不相关的消息
                     if target_message_ids is not None and can_id not in target_message_ids:
@@ -233,6 +266,8 @@ class CANLogParser:
                     # 性能优化：使用预构建的映射直接获取消息
                     message = self._message_id_to_message.get(can_id)
                     if message is None:
+                        if len(unknown_id_samples) < 10:
+                            unknown_id_samples[int(can_id)] = unknown_id_samples.get(int(can_id), 0) + 1
                         skipped_count += 1
                         processed_count += 1
                         continue
@@ -248,6 +283,17 @@ class CANLogParser:
                     except Exception as e:
                         error_count += 1
                         logger.debug(f"解码消息失败: {message.name} (ID: 0x{can_id:03X}), 错误: {e}")
+                        if len(decode_error_samples) < 10:
+                            decode_error_samples.append(
+                                {
+                                    "message_name": getattr(message, "name", ""),
+                                    "can_id": int(can_id),
+                                    "can_id_hex": f"0x{can_id:X}",
+                                    "dlc": int(getattr(msg, "dlc", 0) or 0),
+                                    "data_hex": bytes(msg.data).hex() if getattr(msg, "data", None) is not None else "",
+                                    "error": str(e),
+                                }
+                            )
                         processed_count += 1
                         continue
                     
@@ -325,6 +371,14 @@ class CANLogParser:
             logger.info(f"  解析耗时: {parse_time:.2f} 秒")
             if parse_time > 0:
                 logger.info(f"  处理速度: {processed_count/parse_time:.0f} 消息/秒")
+            if target_message_ids is not None:
+                logger.info("  过滤模式: target_can_id_count=%s", len(target_message_ids))
+            if first_frame_samples:
+                logger.info("  首帧采样(前%s帧): %s", len(first_frame_samples), first_frame_samples)
+            if unknown_id_samples:
+                logger.info("  未在 DBC 中定义的 CAN ID 采样(最多10个): %s", unknown_id_samples)
+            if decode_error_samples:
+                logger.info("  解码错误采样(最多10条): %s", decode_error_samples)
             logger.info("=" * 60)
             
             if not parsed_data:
