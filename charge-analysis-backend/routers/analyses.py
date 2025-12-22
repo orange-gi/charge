@@ -28,7 +28,6 @@ from services.analysis_service import get_analysis_service
 
 router = APIRouter(prefix="/api/analyses", tags=["analyses"])
 settings = get_settings()
-analysis_service = get_analysis_service()
 logger = logging.getLogger(__name__)
 
 
@@ -191,6 +190,8 @@ async def run_analysis(
 
     # 传递信号列表给分析服务
     signal_names = request.signal_names if request.signal_names else None
+    # 延迟初始化：避免启动阶段就加载工作流/向量库依赖
+    analysis_service = get_analysis_service()
     background_tasks.add_task(analysis_service.run_analysis, analysis_id, signal_names)
     return AnalysisRunResponse(analysis_id=analysis_id, status="processing")
 
@@ -216,6 +217,8 @@ def cancel_analysis(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析不存在")
 
     # 无论状态如何，都执行取消操作（总是成功）
+    # 延迟初始化：避免启动阶段就加载工作流/向量库依赖
+    analysis_service = get_analysis_service()
     cancelled = analysis_service.cancel_analysis(analysis_id)
     
     # cancel_analysis 总是返回 True，所以这里总是成功
