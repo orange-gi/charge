@@ -2,13 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import logging
+import os
 import time
 from typing import Any, Callable
+
+# 在导入 chromadb 之前禁用遥测
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("DO_NOT_TRACK", "1")
 
 import chromadb
 from chromadb.api.models.Collection import Collection
 
 from config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# 抑制 ChromaDB 遥测日志
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry.product").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 
 
 @dataclass(frozen=True)
@@ -95,7 +108,15 @@ def _get_embedder():
     from sentence_transformers import SentenceTransformer
 
     settings = get_settings()
-    return SentenceTransformer(settings.bge_model_name)
+    # 优先使用本地模型路径，如果路径存在且有效，则使用本地路径
+    # 否则使用模型名称（会从 HuggingFace 或其他源下载）
+    if settings.bge_model_path and settings.bge_model_path.exists():
+        model_path = str(settings.bge_model_path.resolve())
+        logger.info(f"使用本地 BGE 模型路径: {model_path}")
+        return SentenceTransformer(model_path)
+    else:
+        logger.info(f"使用 BGE 模型名称: {settings.bge_model_name}")
+        return SentenceTransformer(settings.bge_model_name)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:

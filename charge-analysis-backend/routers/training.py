@@ -40,6 +40,7 @@ from schemas import (
     KeywordEvalResponse,
     ModelPublishRequest,
     ModelPublishResponse,
+    ModelVersionCreateRequest,
     ModelVersionCreateResponse,
     SftLoraTaskCreateRequest,
     TaskStartResponse,
@@ -875,22 +876,17 @@ def publish_task_model(
 
 @router.post("/models", response_model=ModelVersionCreateResponse)
 def create_model_version(
-    name: str = Form(..., example="DC诊断模型"),
-    model_type: str = Form("flow_control", example="flow_control"),
-    version: str = Form(..., example="v1.0.0"),
-    model_path: str = Form(..., example="/models/task_15_v1.bin"),
-    config: str | None = Form(None, example='{"target_environment":"prod-shanghai"}'),
-    metrics: str | None = Form(None, example='{"accuracy":0.92}'),
+    payload: ModelVersionCreateRequest = Body(...),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     record = ModelVersion(
-        name=name,
-        model_type=model_type,
-        version=version,
-        model_path=model_path,
-        config=config,
-        metrics=metrics,
+        name=payload.name,
+        model_type=payload.model_type,
+        version=payload.version,
+        model_path=payload.model_path,
+        config=payload.config,
+        metrics=payload.metrics,
         created_by=user.id,
     )
     db.add(record)

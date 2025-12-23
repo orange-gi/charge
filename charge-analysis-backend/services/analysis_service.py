@@ -150,7 +150,7 @@ class AnalysisService:
         progress_callback = self._progress_callback_factory(analysis_id)
         workflow_trace = create_initial_workflow_trace(file_path.name, file_size or 0, created_at)
 
-        return {
+        initial_state = {
             "analysis_id": str(analysis_id),
             "file_path": str(file_path),
             "file_name": file_path.name,
@@ -165,7 +165,10 @@ class AnalysisService:
             "selected_signals": signal_names,  # 添加用户选择的信号列表
             "workflow_trace": workflow_trace,
             "parsed_data_records": None,
+            "raw_messages": None,  # 原始消息数据
         }
+        logger.info(f"_build_initial_state: selected_signals={initial_state.get('selected_signals')}")
+        return initial_state
 
     def _progress_callback_factory(self, analysis_id: int):
         async def _progress(stage: str, progress: float, message: str | None = None) -> None:
@@ -368,6 +371,8 @@ class AnalysisService:
             "llm_analysis": _serialize(state.get("llm_analysis")),
             "data_stats": _serialize(state.get("data_stats")),
             "parsed_data": _serialize(state.get("parsed_data_records")),
+            "raw_messages": _serialize(state.get("raw_messages")),  # 添加原始消息数据
+            "selected_signals": _serialize(state.get("selected_signals")),  # 保存选择的信号列表
             "retrieved_documents": _serialize(state.get("retrieved_documents")),
             "final_report": _serialize(state.get("final_report")),
             "refined_signals": _serialize(state.get("refined_signals")),

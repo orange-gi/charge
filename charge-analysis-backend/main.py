@@ -2,7 +2,24 @@
 from __future__ import annotations
 
 import logging
+import os
+import warnings
 from pathlib import Path
+
+# 禁用遥测和追踪（避免 SSL 证书验证错误和 PostHog 连接问题）
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGCHAIN_ENABLE_TRACING"] = "false"
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["LANGCHAIN_TELEMETRY"] = "false"
+
+# 抑制遥测相关的警告和错误
+warnings.filterwarnings("ignore", message=".*telemetry.*")
+warnings.filterwarnings("ignore", message=".*Telemetry.*")
+warnings.filterwarnings("ignore", message=".*posthog.*")
+warnings.filterwarnings("ignore", message=".*PostHog.*")
+warnings.filterwarnings("ignore", message=".*SSL.*")
+warnings.filterwarnings("ignore", message=".*certificate.*")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +31,14 @@ from routers import analyses, auth, rag, training
 
 settings = get_settings()
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+
+# 抑制遥测相关的日志（设置为 CRITICAL 以完全隐藏错误消息）
+logging.getLogger("backoff").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.CRITICAL)
+logging.getLogger("posthog").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry.product").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 
 app = FastAPI(
     title=settings.app_name,

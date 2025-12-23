@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-ro
 import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Modal, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
+import ReactECharts from 'echarts-for-react';
 import { useAuthStore } from './stores/authStore';
 import './styles/globals.css';
 import TrainingCenter from './pages/training/TrainingCenter';
@@ -705,6 +706,8 @@ const ChargingPage = () => {
           signalStats: analysisData.data_stats.signal_stats || {},
           timeRange: analysisData.data_stats.time_range || {},
           parsedRecords: analysisData.parsed_data || [],
+          rawMessages: analysisData.raw_messages || [],  // 原始消息数据
+          selectedSignals: analysisData.selected_signals || [],  // 选择的信号列表
           trace: workflowTrace?.message_parsing
         } : {}
       },
@@ -1797,6 +1800,27 @@ const ChargingPage = () => {
                     key: index,
                     ...row
                   }));
+                  
+                  // 原始消息数据
+                  const rawMessages = details.data.rawMessages || [];
+                  const rawMessagesColumns = rawMessages.length > 0
+                    ? Object.keys(rawMessages[0]).map((key) => ({
+                        title: key,
+                        dataIndex: key,
+                        key,
+                        width: key === 'Data' ? 200 : undefined,
+                        render: (text: any) => {
+                          if (key === 'Time') {
+                            return typeof text === 'number' ? text.toFixed(6) : text;
+                          }
+                          return text;
+                        }
+                      }))
+                    : [];
+                  const rawMessagesTableData = rawMessages.map((row: any, index: number) => ({
+                    key: index,
+                    ...row
+                  }));
 
                   const overviewContent = (
                     <div>
@@ -1913,6 +1937,182 @@ const ChargingPage = () => {
                     </div>
                   );
                   
+                  // 图表数据准备
+                  const selectedSignalsList = details.data.selectedSignals || [];
+                  const metadataColumns = ['timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'];
+                  
+                  // 获取要展示的信号列表（如果选择了信号，则只展示选择的；否则展示所有数值型信号）
+                  // 如果用户选择了信号，严格只显示这些信号（即使数据中没有也要显示，这样用户知道哪些信号缺失）
+                  const signalsToDisplay = selectedSignalsList.length > 0 
+                    ? selectedSignalsList  // 直接使用选择的信号列表，不进行过滤
+                    : parsedColumns
+                        .filter((col: any) => !metadataColumns.includes(col.key))
+                        .slice(0, 10)  // 最多展示10个信号
+                        .map((col: any) => col.key);
+                  
+                  // 准备图表数据
+                  const chartData: any[] = [];
+                  const timeColumn = parsedColumns.find((col: any) => ['ts', 'timestamp', 'time', 'Time'].includes(col.key));
+                  const timeKey = timeColumn ? timeColumn.key : null;
+                  
+                  signalsToDisplay.forEach((signalName: string) => {
+                    if (!parsedRecords || parsedRecords.length === 0) return;
+                    
+                    // 检查信号是否在数据中存在
+                    const signalExists = parsedRecords.some((record: any) => signalName in record);
+                    if (!signalExists && selectedSignalsList.length > 0) {
+                      // 如果用户选择了信号但数据中没有，创建一个空图表提示
+                      chartData.push({
+                        signalName,
+                        timeData: [],
+                        valueData: [],
+                        missing: true
+                      });
+                      return;
+                    }
+                    
+                    // 提取时间和信号值
+                    const timeData: any[] = [];
+                    const valueData: any[] = [];
+                    
+                    parsedRecords.forEach((record: any, index: number) => {
+                      let timeValue = null;
+                      if (timeKey && record[timeKey]) {
+                        try {
+                          const time = typeof record[timeKey] === 'string' 
+                            ? new Date(record[timeKey]).getTime() 
+                            : record[timeKey];
+                          timeValue = time;
+                        } catch (e) {
+                          timeValue = index;  // 如果时间解析失败，使用索引
+                        }
+                      } else {
+                        timeValue = index;
+                      }
+                      
+                      const signalValue = record[signalName];
+                      if (signalValue !== null && signalValue !== undefined && !isNaN(signalValue)) {
+                        timeData.push(timeValue);
+                        valueData.push(Number(signalValue));
+                      }
+                    });
+                    
+                    if (valueData.length > 0 || selectedSignalsList.length > 0) {
+                      // 即使用户选择了信号但数据为空，也显示图表（用于提示）
+                      chartData.push({
+                        signalName,
+                        timeData,
+                        valueData,
+                        missing: valueData.length === 0 && selectedSignalsList.length > 0
+                      });
+                    }
+                  });
+                  
+                  // 创建图表配置（每个信号一个图表，垂直排列）
+                  const graphContent = chartData.length > 0 ? (
+                    <div style={{ maxHeight: '600px', overflowY: 'auto' }}>
+                      {chartData.map((data, index) => {
+                        // 如果信号缺失或数据为空，显示提示
+                        if (data.missing || (data.valueData.length === 0 && selectedSignalsList.length > 0)) {
+                          return (
+                            <div key={data.signalName} style={{ marginBottom: '20px', border: '1px solid #ffccc7', borderRadius: '8px', padding: '12px', background: '#fff2f0' }}>
+                              <Typography.Text strong style={{ color: '#ff4d4f' }}>
+                                {data.signalName}
+                              </Typography.Text>
+                              <Typography.Text type="secondary" style={{ display: 'block', marginTop: '8px' }}>
+                                该信号在解析数据中未找到，可能信号名称不匹配或数据中确实不包含此信号
+                              </Typography.Text>
+                            </div>
+                          );
+                        }
+                        
+                        const option = {
+                          title: {
+                            text: data.signalName,
+                            left: 'center',
+                            textStyle: { fontSize: 14, fontWeight: 'bold' }
+                          },
+                          tooltip: {
+                            trigger: 'axis',
+                            formatter: (params: any) => {
+                              const param = params[0];
+                              const timeStr = timeKey 
+                                ? new Date(param.value[0]).toLocaleString('zh-CN')
+                                : `索引: ${param.value[0]}`;
+                              return `${data.signalName}<br/>${timeStr}<br/>值: ${param.value[1]}`;
+                            }
+                          },
+                          grid: {
+                            left: '3%',
+                            right: '4%',
+                            bottom: '3%',
+                            containLabel: true,
+                            height: '80px'  // 高度改为原来的1/3（200px -> 80px）
+                          },
+                          xAxis: {
+                            type: 'category',
+                            boundaryGap: false,
+                            data: data.timeData.map((t: any) => {
+                              if (timeKey) {
+                                try {
+                                  return new Date(t).toLocaleTimeString('zh-CN');
+                                } catch {
+                                  return t;
+                                }
+                              }
+                              return t;
+                            }),
+                            axisLabel: {
+                              rotate: 45,
+                              fontSize: 10
+                            }
+                          },
+                          yAxis: {
+                            type: 'value',
+                            axisLabel: {
+                              fontSize: 10
+                            }
+                          },
+                          series: [{
+                            name: data.signalName,
+                            type: 'line',
+                            smooth: true,
+                            data: data.valueData,  // 直接使用数值数组
+                            symbol: 'circle',
+                            symbolSize: 4,
+                            lineStyle: {
+                              width: 2
+                            },
+                            itemStyle: {
+                              color: `hsl(${(index * 137.5) % 360}, 70%, 50%)`  // 使用不同颜色
+                            }
+                          }]
+                        };
+                        
+                        return (
+                          <div key={data.signalName} style={{ marginBottom: '20px', border: '1px solid #e8e8e8', borderRadius: '8px', padding: '12px' }}>
+                            <ReactECharts 
+                              option={option} 
+                              style={{ height: '120px', width: '100%' }}  // 高度改为原来的1/3（250px -> 120px）
+                              opts={{ renderer: 'canvas' }}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: '40px', color: '#8c8c8c' }}>
+                      暂无信号数据可用于图表展示
+                      {selectedSignalsList.length > 0 && (
+                        <div style={{ marginTop: '16px' }}>
+                          <Typography.Text type="secondary">
+                            已选择 {selectedSignalsList.length} 个信号，但数据中未找到这些信号
+                          </Typography.Text>
+                        </div>
+                      )}
+                    </div>
+                  );
+                  
                   return (
                     <div>
                       {renderTraceInfo(details.data.trace)}
@@ -1920,7 +2120,21 @@ const ChargingPage = () => {
                         defaultActiveKey="overview"
                         items={[
                           { key: 'overview', label: '数据概览', children: overviewContent },
-                          { key: 'raw', label: parsedRecords.length ? `解析数据（${parsedRecords.length} 行）` : '解析数据', children: rawDataContent }
+                          { key: 'graph', label: signalsToDisplay.length > 0 ? `图表（${signalsToDisplay.length} 个信号）` : '图表', children: graphContent },
+                          { key: 'parsed', label: parsedRecords.length ? `解析数据（${parsedRecords.length} 行）` : '解析数据', children: rawDataContent },
+                          { key: 'raw', label: rawMessages.length ? `原始数据（${rawMessages.length} 行）` : '原始数据', children: rawMessages.length > 0 ? (
+                            <Table
+                              columns={rawMessagesColumns}
+                              dataSource={rawMessagesTableData}
+                              pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'] }}
+                              scroll={{ x: 'max-content', y: 420 }}
+                              size="small"
+                            />
+                          ) : (
+                            <div style={{ textAlign: 'center', padding: '40px', color: '#8c8c8c' }}>
+                              暂无原始消息数据
+                            </div>
+                          ) }
                         ]}
                       />
                     </div>

@@ -153,6 +153,66 @@ class CANLogParser:
         else:
             raise ValueError(f"不支持的 BLF 文件格式: {file_format}")
     
+    async def collect_raw_messages(
+        self,
+        blf_file_path: str,
+        max_messages: int = 10000
+    ) -> List[Dict[str, Any]]:
+        """收集原始 CAN 消息数据（用于前端展示）
+        
+        Args:
+            blf_file_path: BLF 文件路径
+            max_messages: 最大收集消息数量（避免数据过大）
+        
+        Returns:
+            原始消息列表，每个消息包含 Time, Channel, ID, Name, Dir, DLC, Data, Counter
+        """
+        blf_path = Path(blf_file_path)
+        if not blf_path.exists():
+            return []
+        
+        raw_messages = []
+        counter = 0
+        
+        try:
+            log = can.BLFReader(str(blf_path))
+            message_name_map = {msg.frame_id: msg.name for msg in self.db.messages}
+            
+            for msg in log:
+                if counter >= max_messages:
+                    break
+                
+                can_id = msg.arbitration_id
+                message_name = message_name_map.get(can_id, f"Unknown_0x{can_id:X}")
+                
+                # 格式化数据为十六进制字符串
+                data_hex = ' '.join(f'{b:02X}' for b in msg.data) if msg.data else ''
+                
+                # 尝试获取通道信息（如果可用）
+                channel = getattr(msg, 'channel', 'CAN 1')
+                if isinstance(channel, int):
+                    channel = f"CAN {channel + 1}"
+                elif not isinstance(channel, str):
+                    channel = "CAN 1"
+                
+                raw_message = {
+                    'Time': float(getattr(msg, 'timestamp', 0.0) or 0.0),
+                    'Channel': channel,
+                    'ID': hex(can_id) if can_id > 0xFF else str(can_id),
+                    'Name': message_name,
+                    'Dir': 'Rx',  # 默认为接收，如果需要可以添加发送判断
+                    'DLC': int(getattr(msg, 'dlc', 0) or 0),
+                    'Data': data_hex,
+                    'Counter': counter + 1
+                }
+                raw_messages.append(raw_message)
+                counter += 1
+                
+        except Exception as e:
+            logger.error(f"收集原始消息失败: {e}", exc_info=True)
+        
+        return raw_messages
+    
     async def _detect_blf_format(self, file_path: Path) -> str:
         """检测 BLF 文件格式"""
         try:

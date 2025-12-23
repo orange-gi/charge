@@ -7,6 +7,7 @@ LangGraph 工作流实现
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Dict, Any, List, Optional, TypedDict
 from datetime import datetime
@@ -88,6 +89,8 @@ class ChargingAnalysisState(TypedDict):
     # 前端展示所需
     workflow_trace: Optional[Dict[str, Any]]
     parsed_data_records: Optional[List[Dict[str, Any]]]
+    raw_messages: Optional[List[Dict[str, Any]]]  # 原始 CAN 消息数据
+    selected_signals: Optional[List[str]]  # 用户选择的信号列表
 
 
 def _iso_now() -> str:
@@ -259,10 +262,11 @@ class MessageParsingNode:
             
             # 获取用户选择的信号列表，如果未指定则使用默认过滤信号
             selected_signals = state.get('selected_signals')
-            if selected_signals:
+            logger.info(f"从 state 获取 selected_signals: {selected_signals} (type: {type(selected_signals)})")
+            if selected_signals and len(selected_signals) > 0:
                 # 使用用户选择的信号（仅解析这些信号，极大提升速度）
                 filter_signals = selected_signals
-                logger.info(f"使用用户选择的 {len(filter_signals)} 个信号进行解析")
+                logger.info(f"使用用户选择的 {len(filter_signals)} 个信号进行解析: {filter_signals[:5]}{'...' if len(filter_signals) > 5 else ''}")
             else:
                 # 使用默认的过滤信号列表（基于当前 DBC 动态匹配）
                 all_signals = can_parser.get_available_signals()
@@ -284,6 +288,17 @@ class MessageParsingNode:
             # 检查文件类型
             file_ext = Path(file_path).suffix.lower()
             
+            # 收集原始消息数据（用于前端展示）
+            raw_messages = []
+            if file_ext == '.blf':
+                try:
+                    if state.get('progress_callback'):
+                        await state['progress_callback']("报文解析", 12, "收集原始消息数据...")
+                    raw_messages = await can_parser.collect_raw_messages(file_path, max_messages=10000)
+                    logger.info(f"收集到 {len(raw_messages)} 条原始消息数据")
+                except Exception as e:
+                    logger.warning(f"收集原始消息数据失败: {e}，将跳过原始数据展示")
+            
             if file_ext == '.blf':
                 # 使用 CAN 解析器解析 BLF 文件（高性能版本）
                 df_parsed = await can_parser.parse_blf(
@@ -297,32 +312,83 @@ class MessageParsingNode:
                 df_parsed = await self._parse_file_fallback(file_path, filter_signals)
             
             if df_parsed.empty:
-                raise ValueError("未能从日志文件中解析出任何数据")
+                logger.warning("解析出的 DataFrame 为空，这可能意味着没有匹配到 CAN 消息")
+                # 不抛出异常，而是返回空数据，让工作流继续
+                df_cleaned = df_parsed
+                stats = {
+                    'total_records': 0,
+                    'time_range': {'start': '', 'end': ''},
+                    'signal_stats': {},
+                    'signal_count': len([col for col in df_parsed.columns if col not in {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}])
+                }
+            else:
+                # 数据预处理和清洗
+                if state.get('progress_callback'):
+                    await state['progress_callback']("报文解析", 85, "正在进行数据清洗...")
+                
+                logger.info(f"解析出 {len(df_parsed)} 条原始记录，{len(df_parsed.columns)} 个列")
+                df_cleaned = await self._clean_data(df_parsed)
+                logger.info(f"数据清洗后剩余 {len(df_cleaned)} 条记录")
+                
+                # 如果清洗后数据为空，使用原始数据的前1000条（避免数据全部丢失）
+                if df_cleaned.empty and not df_parsed.empty:
+                    logger.warning("数据清洗后为空，使用原始数据的前1000条记录")
+                    df_cleaned = df_parsed.head(1000)
+                
+                # 如果用户选择了特定信号，先过滤数据（用于统计和显示）
+                metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+                if selected_signals and len(selected_signals) > 0:
+                    # 过滤数据，只保留选择的信号列（保留元数据列）
+                    columns_to_keep = [col for col in df_cleaned.columns if col in metadata_columns or col in selected_signals]
+                    df_for_display = df_cleaned[columns_to_keep]
+                    logger.info(f"信号过滤：保留 {len(columns_to_keep)} 列（{len(selected_signals)} 个选择的信号 + {len(columns_to_keep) - len(selected_signals)} 个元数据列）")
+                    logger.debug(f"保留的列：{columns_to_keep}")
+                else:
+                    df_for_display = df_cleaned
+                
+                # 提取关键统计信息（使用过滤后的数据）
+                stats = await self._extract_statistics(df_for_display)
             
-            # 数据预处理和清洗
-            if state.get('progress_callback'):
-                await state['progress_callback']("报文解析", 85, "正在进行数据清洗...")
+            # 限制保存的记录数量，避免数据过大（最多保存10000条）
+            max_records = 10000
+            if len(df_for_display) > max_records:
+                logger.info(f"解析数据有 {len(df_for_display)} 条记录，限制为前 {max_records} 条用于前端展示")
+                df_for_records = df_for_display.head(max_records)
+            else:
+                df_for_records = df_for_display
+                
+            parsed_records = df_for_records.to_dict(orient='records')
             
-            df_cleaned = await self._clean_data(df_parsed)
+            # 确保 parsed_records 可以被序列化（处理 pandas Timestamp 等类型）
+            import pandas as pd
+            serializable_records = []
+            for record in parsed_records:
+                serializable_record = {}
+                for k, v in record.items():
+                    if pd.isna(v):
+                        serializable_record[k] = None
+                    elif isinstance(v, pd.Timestamp):
+                        serializable_record[k] = v.isoformat()
+                    elif isinstance(v, (int, float)) and (math.isnan(v) or math.isinf(v)):
+                        serializable_record[k] = None
+                    else:
+                        serializable_record[k] = v
+                serializable_records.append(serializable_record)
             
-            # 提取关键统计信息
-            stats = await self._extract_statistics(df_cleaned)
-            
-            if state.get('progress_callback'):
-                await state['progress_callback']("报文解析", 100, "报文解析完成")
-            
-            parsed_records = df_cleaned.to_dict(orient='records')
             result_state = {
                 **state,
-                'parsed_data': df_cleaned,
-                'parsed_data_records': parsed_records,
+                'parsed_data': df_for_display,  # 使用过滤后的数据
+                'parsed_data_records': serializable_records,
+                'raw_messages': raw_messages,  # 添加原始消息数据
                 'data_stats': stats,
                 'parsing_status': 'completed',
+                'selected_signals': selected_signals if selected_signals else None,  # 保存选择的信号列表
                 'dbc_signals': can_parser.get_available_signals(),
                 'dbc_file_used': dbc_path or str(can_parser.dbc_file_path),
             }
             mark_node_completed(result_state, "message_parsing", {
-                "records": len(parsed_records),
+                "records": len(serializable_records),
+                "total_parsed_records": len(df_cleaned),  # 实际解析的总记录数
                 "signal_count": stats.get('signal_count', 0),
                 "dbc": result_state.get("dbc_file_used"),
             })
@@ -362,33 +428,62 @@ class MessageParsingNode:
     
     async def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """数据清洗，基于实际数据列"""
+        if df.empty:
+            logger.warning("输入 DataFrame 为空，跳过数据清洗")
+            return df
+            
         df_cleaned = df.copy()
         
         # 排除元数据列
         metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
         signal_columns = [col for col in df_cleaned.columns if col not in metadata_columns]
         
-        # 移除所有信号列的空值（如果某行所有信号都为空，则删除该行）
-        if signal_columns:
-            df_cleaned = df_cleaned.dropna(subset=signal_columns[:5], how='all')  # 至少前5个信号不全为空
+        if not signal_columns:
+            logger.warning("未找到信号列，返回原始数据")
+            return df_cleaned
         
-        # 对数值型信号移除明显异常值（超出合理范围的值）
+        # 移除所有信号列都为空的行（保留至少有一个信号有值的行）
+        if signal_columns:
+            # 只删除所有信号列都为空的行
+            df_cleaned = df_cleaned.dropna(subset=signal_columns, how='all')
+        
+        if df_cleaned.empty:
+            logger.warning("数据清洗后 DataFrame 为空，返回原始数据")
+            return df  # 返回原始数据，避免数据全部丢失
+        
+        # 对数值型信号进行异常值处理（不删除行，只标记或限制值）
+        # 注意：这里不删除行，而是将异常值替换为边界值，避免数据丢失
         for col in signal_columns:
             if col not in df_cleaned.columns:
                 continue
             if pd.api.types.is_numeric_dtype(df_cleaned[col]):
-                # 使用IQR方法检测异常值
-                Q1 = df_cleaned[col].quantile(0.25)
-                Q3 = df_cleaned[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 3 * IQR  # 使用3倍IQR以保留更多数据
-                upper_bound = Q3 + 3 * IQR
-                # 只过滤极端异常值
-                df_cleaned = df_cleaned[
-                    (df_cleaned[col] >= lower_bound) & 
-                    (df_cleaned[col] <= upper_bound)
-                ]
+                try:
+                    # 计算分位数，但只在有足够数据时进行
+                    non_null_values = df_cleaned[col].dropna()
+                    if len(non_null_values) < 4:  # 至少需要4个值才能计算IQR
+                        continue
+                    
+                    Q1 = non_null_values.quantile(0.25)
+                    Q3 = non_null_values.quantile(0.75)
+                    IQR = Q3 - Q1
+                    
+                    # 如果 IQR 为 0（所有值相同），跳过过滤
+                    if IQR == 0:
+                        continue
+                    
+                    lower_bound = Q1 - 10 * IQR  # 使用10倍IQR以保留更多数据
+                    upper_bound = Q3 + 10 * IQR
+                    
+                    # 不删除行，而是将极端异常值替换为边界值（保留数据用于展示）
+                    # 如果数据确实有严重异常，可以在前端展示时处理
+                    # 这里只处理极端的无穷大和负无穷大
+                    df_cleaned[col] = df_cleaned[col].replace([float('inf'), float('-inf')], [upper_bound, lower_bound])
+                    
+                except Exception as e:
+                    logger.warning(f"处理信号 {col} 的异常值时出错: {e}，跳过该列")
+                    continue
         
+        logger.info(f"数据清洗完成: 原始 {len(df)} 条 -> 清洗后 {len(df_cleaned)} 条")
         return df_cleaned
     
     async def _extract_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -405,20 +500,30 @@ class MessageParsingNode:
             try:
                 # 尝试数值统计
                 if pd.api.types.is_numeric_dtype(df[col]):
-                    signal_stats[col] = {
-                        'mean': float(df[col].mean()),
-                        'std': float(df[col].std()),
-                        'min': float(df[col].min()),
-                        'max': float(df[col].max()),
-                        'type': 'numeric'
-                    }
+                    non_null = df[col].dropna()
+                    if len(non_null) > 0:
+                        signal_stats[col] = {
+                            'mean': float(non_null.mean()) if not math.isnan(non_null.mean()) else None,
+                            'std': float(non_null.std()) if not math.isnan(non_null.std()) else None,
+                            'min': float(non_null.min()) if not math.isnan(non_null.min()) else None,
+                            'max': float(non_null.max()) if not math.isnan(non_null.max()) else None,
+                            'type': 'numeric'
+                        }
+                    else:
+                        signal_stats[col] = {
+                            'mean': None,
+                            'std': None,
+                            'min': None,
+                            'max': None,
+                            'type': 'numeric'
+                        }
                 else:
                     # 分类统计
                     unique_vals = df[col].dropna().unique()
                     if len(unique_vals) <= 20:  # 只对类别数较少的列统计分布
                         signal_stats[col] = {
-                            'unique_values': unique_vals.tolist(),
-                            'distribution': df[col].value_counts().to_dict(),
+                            'unique_values': unique_vals.tolist() if len(unique_vals) > 0 else [],
+                            'distribution': df[col].value_counts().to_dict() if len(df[col].dropna()) > 0 else {},
                             'type': 'categorical'
                         }
                     else:
@@ -430,11 +535,25 @@ class MessageParsingNode:
                 logger.warning(f"提取信号 {col} 统计信息失败: {e}")
                 continue
         
+        # 安全地提取时间范围
+        time_start = ''
+        time_end = ''
+        if 'ts' in df.columns and len(df) > 0:
+            try:
+                ts_min = df['ts'].min()
+                ts_max = df['ts'].max()
+                if pd.notna(ts_min):
+                    time_start = ts_min.isoformat() if hasattr(ts_min, 'isoformat') else str(ts_min)
+                if pd.notna(ts_max):
+                    time_end = ts_max.isoformat() if hasattr(ts_max, 'isoformat') else str(ts_max)
+            except Exception as e:
+                logger.warning(f"提取时间范围失败: {e}")
+        
         stats = {
             'total_records': len(df),
             'time_range': {
-                'start': df['ts'].min().isoformat() if 'ts' in df.columns else '',
-                'end': df['ts'].max().isoformat() if 'ts' in df.columns else ''
+                'start': time_start,
+                'end': time_end
             },
             'signal_stats': signal_stats,
             'signal_count': len(signal_columns)
@@ -823,7 +942,31 @@ class LLMAnalysisNode:
     """LLM分析节点"""
     
     def __init__(self):
-        self.llm_client = None  # 实际使用时需要初始化LLM客户端
+        from config import get_settings
+        settings = get_settings()
+        
+        # 如果配置了 API Key 和 Base URL，则初始化 OpenAI 客户端
+        if settings.openai_api_key and settings.openai_base_url:
+            try:
+                from openai import AsyncOpenAI
+                self.llm_client = AsyncOpenAI(
+                    api_key=settings.openai_api_key,
+                    base_url=settings.openai_base_url
+                )
+                self.model_name = settings.llm_model_name
+                logger.info(f"LLM 客户端已初始化: model={self.model_name}, base_url={settings.openai_base_url}")
+            except ImportError:
+                logger.warning("openai 库未安装，将使用模拟 LLM 分析")
+                self.llm_client = None
+                self.model_name = None
+            except Exception as e:
+                logger.error(f"初始化 LLM 客户端失败: {e}，将使用模拟 LLM 分析")
+                self.llm_client = None
+                self.model_name = None
+        else:
+            logger.info("未配置 OPENAI_API_KEY 或 OPENAI_BASE_URL，将使用模拟 LLM 分析")
+            self.llm_client = None
+            self.model_name = None
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理LLM分析"""
@@ -838,9 +981,10 @@ class LLMAnalysisNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("LLM分析", 95, "LLM生成分析报告...")
             
-            # 构建分析提示
+            # 构建分析提示（安全处理可能为 None 的值）
+            problem_direction = problem_direction or 'general_analysis'
             prompt = self._build_analysis_prompt(
-                problem_direction, context, data_stats, refined_signals, validation
+                problem_direction, context, data_stats or {}, refined_signals or [], validation or {}
             )
             
             # 模拟LLM分析
@@ -879,19 +1023,26 @@ class LLMAnalysisNode:
     def _build_analysis_prompt(self, direction: str, context: str, stats: Dict, 
                               signals: List[str], validation: Dict) -> str:
         """构建分析提示，基于实际信号统计"""
-        signal_stats = stats.get('signal_stats', {})
+        # 安全处理可能为 None 的参数
+        direction = direction or 'general_analysis'
+        context = context or ''
+        stats = stats or {}
+        signals = signals or []
+        validation = validation or {}
+        
+        signal_stats = stats.get('signal_stats', {}) if isinstance(stats, dict) else {}
         
         # 构建信号统计描述
         signal_descriptions = []
         for signal_name in signals[:10]:  # 限制显示前10个信号
             if signal_name in signal_stats:
                 signal_data = signal_stats[signal_name]
-                if signal_data.get('type') == 'numeric':
+                if isinstance(signal_data, dict) and signal_data.get('type') == 'numeric':
                     signal_descriptions.append(
                         f"  - {signal_name}: 均值={signal_data.get('mean', 0):.2f}, "
                         f"范围=[{signal_data.get('min', 0):.2f}, {signal_data.get('max', 0):.2f}]"
                     )
-                elif signal_data.get('type') == 'categorical':
+                elif isinstance(signal_data, dict) and signal_data.get('type') == 'categorical':
                     dist = signal_data.get('distribution', {})
                     if dist:
                         signal_descriptions.append(
@@ -905,12 +1056,12 @@ class LLMAnalysisNode:
 
 问题方向：{direction}
 相关信号：{', '.join(signals[:10])}{'...' if len(signals) > 10 else ''}
-信号验证结果：{validation.get('average_quality', 0):.2f}
+        信号验证结果：{validation.get('average_quality', 0) if isinstance(validation, dict) else 0:.2f}
 
 数据统计：
-- 总记录数：{stats.get('total_records', 0)}
-- 解析信号数：{stats.get('signal_count', 0)}
-- 时间范围：{stats.get('time_range', {}).get('start', '')} 至 {stats.get('time_range', {}).get('end', '')}
+- 总记录数：{stats.get('total_records', 0) if isinstance(stats, dict) else 0}
+- 解析信号数：{stats.get('signal_count', 0) if isinstance(stats, dict) else 0}
+- 时间范围：{(stats.get('time_range') or {}).get('start', '') if isinstance(stats, dict) else ''} 至 {(stats.get('time_range') or {}).get('end', '') if isinstance(stats, dict) else ''}
 
 信号统计：
 {signals_text}
@@ -931,9 +1082,87 @@ class LLMAnalysisNode:
     
     async def _llm_analysis(self, prompt: str) -> Dict[str, Any]:
         """LLM分析"""
+        # 如果配置了真实的 LLM 客户端，则调用真实 API
+        if self.llm_client and self.model_name:
+            try:
+                logger.info(f"调用 LLM API: model={self.model_name}")
+                
+                # 构建消息，要求返回 JSON 格式
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "你是一个专业的充电系统分析专家。请根据提供的充电数据分析结果，生成详细的诊断报告。必须以有效的 JSON 格式返回结果，包含以下字段：summary（诊断总结）、findings（关键发现列表）、risk_assessment（风险评估）、recommendations（建议措施列表）、technical_details（技术细节）。"
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+                
+                # 调用 OpenAI 格式的 API
+                response = await self.llm_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2000
+                )
+                
+                # 提取响应内容
+                content = response.choices[0].message.content
+                logger.debug(f"LLM 响应: {content[:200]}...")
+                
+                # 尝试解析 JSON 响应
+                try:
+                    import json
+                    # 尝试提取 JSON 部分（如果响应包含其他文本）
+                    json_start = content.find('{')
+                    json_end = content.rfind('}') + 1
+                    if json_start != -1 and json_end > json_start:
+                        json_str = content[json_start:json_end]
+                        analysis_result = json.loads(json_str)
+                    else:
+                        # 如果整个内容就是 JSON
+                        analysis_result = json.loads(content)
+                    
+                    # 验证必需字段
+                    if not isinstance(analysis_result, dict):
+                        raise ValueError("LLM 返回的不是有效的 JSON 对象")
+                    
+                    # 确保所有必需字段存在
+                    result = {
+                        "summary": analysis_result.get("summary", "分析完成"),
+                        "findings": analysis_result.get("findings", []),
+                        "risk_assessment": analysis_result.get("risk_assessment", "未知"),
+                        "recommendations": analysis_result.get("recommendations", []),
+                        "technical_details": analysis_result.get("technical_details", "")
+                    }
+                    
+                    logger.info("LLM 分析完成")
+                    return result
+                    
+                except json.JSONDecodeError as e:
+                    logger.warning(f"LLM 返回的 JSON 解析失败: {e}，使用文本作为摘要")
+                    # 如果 JSON 解析失败，将内容作为摘要返回
+                    return {
+                        "summary": content[:500],
+                        "findings": [],
+                        "risk_assessment": "未知",
+                        "recommendations": [],
+                        "technical_details": content
+                    }
+                    
+            except Exception as e:
+                logger.error(f"调用 LLM API 失败: {e}，回退到模拟分析")
+                # 发生错误时回退到模拟分析
+                return await self._mock_llm_analysis()
+        else:
+            # 使用模拟分析
+            return await self._mock_llm_analysis()
+    
+    async def _mock_llm_analysis(self) -> Dict[str, Any]:
+        """模拟 LLM 分析（当未配置真实 API 时使用）"""
         await asyncio.sleep(1.5)  # 模拟分析时间
         
-        # 模拟分析结果
         mock_analysis = {
             "summary": "检测到充电系统电流异常波动，可能影响充电效率。",
             "findings": [
@@ -1012,8 +1241,14 @@ class ReportGenerationNode:
         # 模拟报告生成
         await asyncio.sleep(0.5)
         
-        analysis = data.get('llm_analysis', {})
+        analysis = data.get('llm_analysis') or {}
         summary = self._generate_summary(data)
+        
+        # 安全获取 confidence_score
+        flow_analysis = data.get('flow_analysis')
+        confidence_score = 0.0
+        if flow_analysis and isinstance(flow_analysis, dict):
+            confidence_score = flow_analysis.get('confidence', 0.0)
         
         return {
             'html_content': f"<html><body><h1>充电分析报告</h1><p>{summary}</p></body></html>",
@@ -1022,26 +1257,29 @@ class ReportGenerationNode:
             'metadata': {
                 'generated_at': datetime.now().isoformat(),
                 'version': '1.0',
-                'confidence_score': data.get('flow_analysis', {}).get('confidence', 0)
+                'confidence_score': confidence_score
             }
         }
     
     def _generate_summary(self, data: Dict[str, Any]) -> str:
         """生成摘要"""
-        analysis = data.get('llm_analysis', {})
-        validation = data.get('validation', {})
+        analysis = data.get('llm_analysis') or {}
+        validation = data.get('validation') or {}
         
         summary_parts = []
-        if 'summary' in analysis:
+        if analysis and isinstance(analysis, dict) and 'summary' in analysis:
             summary_parts.append(f"诊断结论：{analysis['summary']}")
         
-        if validation.get('validated'):
+        if validation and isinstance(validation, dict) and validation.get('validated'):
             signal_count = validation.get('signal_count', 0)
             summary_parts.append(f"基于{signal_count}个高质量信号进行分析")
         
-        if 'risk_assessment' in analysis:
+        if analysis and isinstance(analysis, dict) and 'risk_assessment' in analysis:
             risk = analysis['risk_assessment']
             summary_parts.append(f"风险评估：{risk}")
+        
+        if not summary_parts:
+            return "分析完成，未发现明显异常。"
         
         return "；".join(summary_parts)
     
@@ -1145,8 +1383,10 @@ class ChargingAnalysisWorkflow:
             initial_state.setdefault('analysis_status', AnalysisStatus.PENDING)
             initial_state.setdefault('workflow_trace', {})
             initial_state.setdefault('parsed_data_records', None)
+            initial_state.setdefault('selected_signals', None)
             
             logger.info(f"开始执行充电分析工作流: {initial_state['analysis_id']}")
+            logger.info(f"initial_state 中的 selected_signals: {initial_state.get('selected_signals')}")
             
             # 执行工作流
             final_state = await self._app.ainvoke(initial_state)

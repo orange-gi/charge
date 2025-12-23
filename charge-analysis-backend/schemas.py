@@ -465,6 +465,7 @@ class ModelPublishResponse(BaseModel):
     endpoint_url: Optional[str] = None
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         json_schema_extra={
             "example": {
                 "model_version_id": 9,
@@ -479,7 +480,31 @@ class ModelVersionCreateResponse(BaseModel):
     model_version_id: int
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         json_schema_extra={"example": {"model_version_id": 9}}
+    )
+
+
+class ModelVersionCreateRequest(BaseModel):
+    name: str
+    model_type: str = Field(default="flow_control")
+    version: str
+    model_path: str
+    config: Optional[str] = None
+    metrics: Optional[str] = None
+
+    model_config = ConfigDict(
+        protected_namespaces=(),
+        json_schema_extra={
+            "example": {
+                "name": "DC诊断模型",
+                "model_type": "flow_control",
+                "version": "v1.0.0",
+                "model_path": "/models/task_15_v1.bin",
+                "config": '{"target_environment":"prod-shanghai"}',
+                "metrics": '{"accuracy":0.92}',
+            }
+        }
     )
 
 
@@ -513,6 +538,7 @@ class TrainingConfigRequest(BaseModel):
     notes: Optional[str] = None
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         json_schema_extra={
             "example": {
                 "name": "DC充电LoRA配置",
@@ -534,6 +560,7 @@ class TrainingConfigResponse(TrainingConfigRequest):
     updated_at: datetime
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         from_attributes=True,
         json_schema_extra={
             "example": {
@@ -564,6 +591,7 @@ class TrainingTaskCreateRequest(BaseModel):
     hyperparameters: dict[str, Any] | None = None
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         json_schema_extra={
             "example": {
                 "name": "国标异常诊断-批次1",
@@ -595,6 +623,8 @@ class SftLoraTaskCreateRequest(BaseModel):
     dataset_id: int
     model_type: str = Field(default="flow_control")
     yaml_text: str = Field(min_length=1)
+
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class KeywordEvalItem(BaseModel):
@@ -630,6 +660,7 @@ class TrainingTaskResponse(BaseModel):
     config_id: Optional[int]
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         from_attributes=True,
         json_schema_extra={
             "example": {
@@ -654,6 +685,7 @@ class TrainingTaskDetailResponse(TrainingTaskResponse):
     updated_at: datetime
 
     model_config = ConfigDict(
+        protected_namespaces=(),
         from_attributes=True,
         json_schema_extra={
             "example": {

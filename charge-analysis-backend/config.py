@@ -76,6 +76,10 @@ class Settings(BaseSettings):
         default="BAAI/bge-base-zh-v1.5",
         env="BGE_MODEL_NAME"
     )
+    bge_model_path: Optional[Path] = Field(
+        default=Path("../CHARGE/models"),
+        env="BGE_MODEL_PATH"
+    )
     small_model_path: Path = Field(
         default=Path("models/1.5b_flow_control_model"),
         env="SMALL_MODEL_PATH"
@@ -90,6 +94,10 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(
         default="https://api.openai.com/v1",
         env="OPENAI_BASE_URL"
+    )
+    llm_model_name: str = Field(
+        default="deepseek-reasoner",
+        env="LLM_MODEL_NAME"
     )
     
     # 训练配置
