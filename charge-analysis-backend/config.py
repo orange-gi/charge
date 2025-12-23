@@ -66,6 +66,11 @@ class Settings(BaseSettings):
         default=Path("chromadb_data"),
         env="CHROMA_PERSIST_DIRECTORY"
     )
+    # 可选：使用独立 Chroma Server（避免嵌入式 client 在 Windows 上触发 native 崩溃）
+    # 示例：
+    # - http://127.0.0.1:8001
+    # - http://chroma:8000
+    chroma_http_url: str = Field(default="", env="CHROMA_HTTP_URL")
     chroma_collection_name: str = Field(
         default="charging_knowledge",
         env="CHROMA_COLLECTION_NAME"

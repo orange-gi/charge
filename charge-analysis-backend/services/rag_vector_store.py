@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import time
+from urllib.parse import urlparse
 from typing import Any, Callable
 
 import chromadb
@@ -22,7 +23,19 @@ class VectorHit:
 class ChromaVectorStore:
     def __init__(self) -> None:
         settings = get_settings()
-        self._client = chromadb.PersistentClient(path=str(settings.chroma_persist_directory))
+        # Windows 下嵌入式 PersistentClient 偶发 native 崩溃（Segmentation fault）。
+        # 提供 HTTP 模式：使用独立 Chroma Server，把崩溃隔离到向量库进程。
+        chroma_http_url = (getattr(settings, "chroma_http_url", "") or "").strip()
+        if chroma_http_url:
+            parsed = urlparse(chroma_http_url)
+            if not parsed.hostname:
+                raise ValueError(f"CHROMA_HTTP_URL 不合法：{chroma_http_url}")
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            ssl = parsed.scheme == "https"
+            self._client = chromadb.HttpClient(host=host, port=int(port), ssl=ssl)
+        else:
+            self._client = chromadb.PersistentClient(path=str(settings.chroma_persist_directory))
 
     def get_or_create_collection(self, chroma_collection_id: str) -> Collection:
         if not chroma_collection_id or not isinstance(chroma_collection_id, str):
