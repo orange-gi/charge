@@ -34,9 +34,27 @@ cors_common = dict(
     expose_headers=["*"],
 )
 
-if str(getattr(settings, "environment", "development")).lower() in {"production", "prod"}:
-    app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins, **cors_common)
+env = str(getattr(settings, "environment", "development")).lower()
+
+# 本地开发兜底：无论是否被误设为 production，都至少允许 localhost / 127.0.0.1 常见端口
+local_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+local_origin_allowlist = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+if env in {"production", "prod"}:
+    allowlist = list(dict.fromkeys([*(settings.allowed_origins or []), *local_origin_allowlist]))
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowlist,
+        allow_origin_regex=local_origin_regex,
+        **cors_common,
+    )
 else:
+    # 为了开箱即用：development 允许任意来源（通过 regex 回显具体 Origin，兼容 credentials）
     app.add_middleware(CORSMiddleware, allow_origin_regex=".*", **cors_common)
 
 # 使用国内可访问的 CDN 配置自定义 Swagger UI
