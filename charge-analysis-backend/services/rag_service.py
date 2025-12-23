@@ -24,7 +24,7 @@ from database import session_scope
 from models import KnowledgeCollection, KnowledgeDocument, RAGQuery, RagDocumentLog, LogLevel
 from services.rag_cache import HybridCache
 from services.rag_normalize import extract_candidate_primary_tag, normalize_primary_tag_value, normalize_text
-from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts
+from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts_batched
 
 logger = logging.getLogger(__name__)
 
@@ -605,28 +605,66 @@ class RagService:
             },
         )
 
+        # --- embedding（分批 + 进度日志）---
+        total_rows = len(docs)
+        self._append_document_log(document_id, LogLevel.INFO, "开始 embedding", {"rows": total_rows, "batch_size": 32})
         t_embed = time.time()
-        embeddings = embed_texts(docs)
+        last_percent = -1
+
+        def _on_embed_batch(done: int, total: int, batch_ms: int) -> None:
+            nonlocal last_percent
+            percent = int(done * 100 / max(1, total))
+            # 限流：每提升 5% 或最后一次才记录
+            if percent >= last_percent + 5 or done >= total:
+                last_percent = percent
+                self._append_document_log(
+                    document_id,
+                    LogLevel.INFO,
+                    f"embedding 进度 {done}/{total}（{percent}%）",
+                    {"done": done, "total": total, "percent": percent, "batch_ms": batch_ms},
+                )
+
+        embeddings = embed_texts_batched(docs, batch_size=32, on_batch=_on_embed_batch)
         self._append_document_log(
             document_id,
             LogLevel.INFO,
             "embedding 完成，准备写入向量库",
-            {"rows": len(docs), "elapsed_ms": int((time.time() - t_embed) * 1000)},
+            {"rows": total_rows, "elapsed_ms": int((time.time() - t_embed) * 1000)},
         )
 
-        t_upsert = time.time()
-        self._vector.upsert(
-            chroma_collection_id=chroma_collection_id,
-            ids=ids,
-            documents=docs,
-            metadatas=metas,
-            embeddings=embeddings,
+        # --- 写入向量库（分批 + 进度日志）---
+        upsert_batch = 256
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "开始写入向量库",
+            {"rows": total_rows, "batch_size": upsert_batch},
         )
+        t_upsert = time.time()
+        upserted = 0
+        for start in range(0, total_rows, upsert_batch):
+            end = min(total_rows, start + upsert_batch)
+            self._vector.upsert(
+                chroma_collection_id=chroma_collection_id,
+                ids=ids[start:end],
+                documents=docs[start:end],
+                metadatas=metas[start:end],
+                embeddings=embeddings[start:end],
+            )
+            upserted = end
+            percent = int(upserted * 100 / max(1, total_rows))
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                f"写入向量库进度 {upserted}/{total_rows}（{percent}%）",
+                {"done": upserted, "total": total_rows, "percent": percent},
+            )
+
         self._append_document_log(
             document_id,
             LogLevel.INFO,
             "向量库写入完成",
-            {"rows": len(docs), "elapsed_ms": int((time.time() - t_upsert) * 1000)},
+            {"rows": total_rows, "elapsed_ms": int((time.time() - t_upsert) * 1000)},
         )
         try:
             wb.close()

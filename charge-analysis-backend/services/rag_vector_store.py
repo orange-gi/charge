@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+import time
+from typing import Any, Callable
 
 import chromadb
 from chromadb.api.models.Collection import Collection
@@ -98,10 +99,37 @@ def _get_embedder():
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
+    return embed_texts_batched(texts)
+
+
+def embed_texts_batched(
+    texts: list[str],
+    *,
+    batch_size: int = 32,
+    on_batch: Callable[[int, int, int], None] | None = None,
+) -> list[list[float]]:
+    """分批 embedding，便于上层输出进度日志。
+
+    - on_batch(done, total, batch_elapsed_ms)
+    """
     model = _get_embedder()
-    # normalize_embeddings=True 对检索更稳定，且便于距离解释
-    vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    return [v.tolist() for v in vectors]
+    total = len(texts)
+    if total == 0:
+        return []
+    bs = int(batch_size) if batch_size and int(batch_size) > 0 else 32
+
+    out: list[list[float]] = []
+    done = 0
+    for start in range(0, total, bs):
+        batch = texts[start : start + bs]
+        t0 = time.time()
+        # normalize_embeddings=True 对检索更稳定，且便于距离解释
+        vectors = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+        out.extend([v.tolist() for v in vectors])
+        done = min(total, start + len(batch))
+        if on_batch:
+            on_batch(done, total, int((time.time() - t0) * 1000))
+    return out
 
 
 def embed_query(text: str) -> list[float]:
