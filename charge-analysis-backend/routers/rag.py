@@ -21,7 +21,6 @@ from services.rag_service import DocumentAlreadyExistsError, get_rag_service
 from config import get_settings
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
-rag_service = get_rag_service()
 settings = get_settings()
 
 
@@ -33,6 +32,7 @@ def create_collection(
     ),
     user: User = Depends(get_current_user),
 ) -> RagCollectionRead:
+    rag_service = get_rag_service()
     try:
         collection = rag_service.create_collection(payload.name, payload.description, user.id)
         return RagCollectionRead.model_validate(collection)
@@ -45,12 +45,14 @@ def create_collection(
 
 @router.get("/collections", response_model=list[RagCollectionRead])
 def list_collections(user: User = Depends(get_current_user)) -> list[RagCollectionRead]:
+    rag_service = get_rag_service()
     records = rag_service.list_collections(user.id)
     return [RagCollectionRead.model_validate(item) for item in records]
 
 
 @router.get("/collections/{collection_id}", response_model=RagCollectionRead)
 def get_collection(collection_id: int, user: User = Depends(get_current_user)) -> RagCollectionRead:
+    rag_service = get_rag_service()
     collection = rag_service.get_collection(collection_id)
     if collection is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
@@ -67,6 +69,7 @@ async def upload_document(
     overwrite: bool = Form(False),
     user: User = Depends(get_current_user),
 ) -> KnowledgeDocumentRead:
+    rag_service = get_rag_service()
     raw_bytes = await file.read()
     if not raw_bytes:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件为空")
@@ -115,6 +118,7 @@ async def upload_document(
 
 @router.get("/collections/{collection_id}/documents", response_model=list[KnowledgeDocumentRead])
 def list_documents(collection_id: int, user: User = Depends(get_current_user)) -> list[KnowledgeDocumentRead]:
+    rag_service = get_rag_service()
     collection = rag_service.get_collection(collection_id)
     if collection is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
@@ -126,6 +130,7 @@ def list_documents(collection_id: int, user: User = Depends(get_current_user)) -
 
 @router.get("/collections/{collection_id}/documents/{document_id}", response_model=KnowledgeDocumentRead)
 def get_document(collection_id: int, document_id: int, user: User = Depends(get_current_user)) -> KnowledgeDocumentRead:
+    rag_service = get_rag_service()
     collection = rag_service.get_collection(collection_id)
     if collection is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
@@ -145,6 +150,7 @@ def list_document_logs(
     limit: int = 200,
     user: User = Depends(get_current_user),
 ) -> list[RagDocumentLogRead]:
+    rag_service = get_rag_service()
     collection = rag_service.get_collection(collection_id)
     if collection is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
@@ -165,6 +171,7 @@ def list_queries(
     limit: int = 20,
     user: User = Depends(get_current_user),
 ) -> list[RagQueryRecord]:
+    rag_service = get_rag_service()
     collection = rag_service.get_collection(collection_id)
     if collection is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
@@ -182,6 +189,7 @@ def query_knowledge(
     ),
     user: User = Depends(get_current_user),
 ) -> RagQueryResponse:
+    rag_service = get_rag_service()
     result = rag_service.query(
         payload.collection_id,
         payload.query,
