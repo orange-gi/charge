@@ -41,6 +41,14 @@ export interface RAGQueryRecord {
   createdAt: string;
 }
 
+export interface RagDocumentLog {
+  id: number;
+  documentId: number;
+  logLevel: string;
+  message: string;
+  createdAt: string;
+}
+
 interface BackendCollection {
   id: number;
   name: string;
@@ -82,6 +90,14 @@ interface BackendQueryRecord {
   created_at: string;
 }
 
+interface BackendRagDocumentLog {
+  id: number;
+  document_id: number;
+  log_level: string;
+  message: string;
+  created_at: string;
+}
+
 export const ragService = {
   async createCollection(name: string, description: string | undefined, token: string): Promise<KnowledgeCollection> {
     const data = await apiRequest<BackendCollection>('/api/rag/collections', {
@@ -107,6 +123,27 @@ export const ragService = {
       token
     });
     return data.map(transformDocumentData);
+  },
+
+  async getDocument(collectionId: number, documentId: number, token: string): Promise<KnowledgeDocument> {
+    const data = await apiRequest<BackendDocument>(`/api/rag/collections/${collectionId}/documents/${documentId}`, {
+      token
+    });
+    return transformDocumentData(data);
+  },
+
+  async getDocumentLogs(collectionId: number, documentId: number, token: string, limit: number = 200): Promise<RagDocumentLog[]> {
+    const data = await apiRequest<BackendRagDocumentLog[]>(
+      `/api/rag/collections/${collectionId}/documents/${documentId}/logs?limit=${limit}`,
+      { token }
+    );
+    return data.map((item) => ({
+      id: item.id,
+      documentId: item.document_id,
+      logLevel: item.log_level,
+      message: item.message,
+      createdAt: item.created_at
+    }));
   },
 
   async uploadDocument(

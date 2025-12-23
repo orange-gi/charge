@@ -1,7 +1,9 @@
 """知识库（RAG）API。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile, status
 
 from core.dependencies import get_current_user
 from models import User, UserRole
@@ -9,15 +11,18 @@ from schemas import (
     KnowledgeDocumentRead,
     RagCollectionCreate,
     RagCollectionRead,
+    RagDocumentLogRead,
     RagQueryRecord,
     RagQueryRequest,
     RagQueryResponse,
 )
 
 from services.rag_service import DocumentAlreadyExistsError, get_rag_service
+from config import get_settings
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 rag_service = get_rag_service()
+settings = get_settings()
 
 
 @router.post("/collections")
@@ -57,6 +62,7 @@ def get_collection(collection_id: int, user: User = Depends(get_current_user)) -
 @router.post("/collections/{collection_id}/documents")
 async def upload_document(
     collection_id: int,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     overwrite: bool = Form(False),
     user: User = Depends(get_current_user),
@@ -69,14 +75,23 @@ async def upload_document(
     if not (lower.endswith(".xlsx") or lower.endswith(".xlsm")):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="当前仅支持上传 Excel（.xlsx/.xlsm）")
 
+    # 先把文件落盘（后台任务读取）
+    store_dir = Path(settings.upload_path) / "knowledge-docs" / str(collection_id)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    store_path = store_dir / filename
     try:
-        document, _report = rag_service.add_excel_document(
+        store_path.write_bytes(raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"保存文件失败：{exc}") from exc
+
+    try:
+        document = rag_service.prepare_excel_document_upload(
             collection_id=collection_id,
             filename=filename,
+            file_path=str(store_path),
             file_size=len(raw_bytes),
             file_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             user_id=user.id,
-            raw_bytes=raw_bytes,
             overwrite=overwrite,
         )
     except DocumentAlreadyExistsError as exc:
@@ -87,6 +102,14 @@ async def upload_document(
         if "知识库不存在" in msg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg) from exc
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg) from exc
+
+    # 后台异步处理：构建索引并更新状态/日志
+    if background_tasks is not None:
+        background_tasks.add_task(rag_service.process_excel_document_by_id, document.id)
+    else:
+        # 兜底：理论上不会发生
+        rag_service.process_excel_document_by_id(document.id)
+
     return KnowledgeDocumentRead.model_validate(document)
 
 
@@ -99,6 +122,41 @@ def list_documents(collection_id: int, user: User = Depends(get_current_user)) -
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该知识库")
     records = rag_service.list_documents(collection_id)
     return [KnowledgeDocumentRead.model_validate(doc) for doc in records]
+
+
+@router.get("/collections/{collection_id}/documents/{document_id}", response_model=KnowledgeDocumentRead)
+def get_document(collection_id: int, document_id: int, user: User = Depends(get_current_user)) -> KnowledgeDocumentRead:
+    collection = rag_service.get_collection(collection_id)
+    if collection is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
+    if collection.created_by not in {None, user.id} and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该知识库")
+
+    doc = rag_service.get_document(document_id)
+    if doc is None or int(doc.collection_id) != int(collection_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+    return KnowledgeDocumentRead.model_validate(doc)
+
+
+@router.get("/collections/{collection_id}/documents/{document_id}/logs", response_model=list[RagDocumentLogRead])
+def list_document_logs(
+    collection_id: int,
+    document_id: int,
+    limit: int = 200,
+    user: User = Depends(get_current_user),
+) -> list[RagDocumentLogRead]:
+    collection = rag_service.get_collection(collection_id)
+    if collection is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="知识库不存在")
+    if collection.created_by not in {None, user.id} and user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该知识库")
+
+    doc = rag_service.get_document(document_id)
+    if doc is None or int(doc.collection_id) != int(collection_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+
+    logs = rag_service.list_document_logs(document_id, limit=limit)
+    return [RagDocumentLogRead.model_validate(item) for item in logs]
 
 
 @router.get("/collections/{collection_id}/queries", response_model=list[RagQueryRecord])
