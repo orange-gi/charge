@@ -633,7 +633,8 @@ class RagService:
         )
 
         # --- 写入向量库（分批 + 进度日志）---
-        upsert_batch = 256
+        # Windows/小型磁盘环境下，单次 upsert 过大可能导致长时间阻塞（看起来“没进度”）
+        upsert_batch = 128
         self._append_document_log(
             document_id,
             LogLevel.INFO,
@@ -642,22 +643,41 @@ class RagService:
         )
         t_upsert = time.time()
         upserted = 0
-        for start in range(0, total_rows, upsert_batch):
+        total_batches = (total_rows + upsert_batch - 1) // upsert_batch
+        for batch_idx, start in enumerate(range(0, total_rows, upsert_batch), start=1):
             end = min(total_rows, start + upsert_batch)
-            self._vector.upsert(
-                chroma_collection_id=chroma_collection_id,
-                ids=ids[start:end],
-                documents=docs[start:end],
-                metadatas=metas[start:end],
-                embeddings=embeddings[start:end],
+            percent_before = int(start * 100 / max(1, total_rows))
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                f"写入向量库开始（batch {batch_idx}/{total_batches}，{start}/{total_rows}，{percent_before}%）",
+                {"batch": batch_idx, "total_batches": total_batches, "start": start, "end": end},
             )
+            t_batch = time.time()
+            try:
+                self._vector.upsert(
+                    chroma_collection_id=chroma_collection_id,
+                    ids=ids[start:end],
+                    documents=docs[start:end],
+                    metadatas=metas[start:end],
+                    embeddings=embeddings[start:end],
+                )
+            except Exception as exc:
+                self._append_document_log(
+                    document_id,
+                    LogLevel.ERROR,
+                    f"写入向量库失败（batch {batch_idx}/{total_batches}）",
+                    {"error": str(exc), "batch": batch_idx, "start": start, "end": end},
+                )
+                raise
+
             upserted = end
             percent = int(upserted * 100 / max(1, total_rows))
             self._append_document_log(
                 document_id,
                 LogLevel.INFO,
-                f"写入向量库进度 {upserted}/{total_rows}（{percent}%）",
-                {"done": upserted, "total": total_rows, "percent": percent},
+                f"写入向量库完成（batch {batch_idx}/{total_batches}，{upserted}/{total_rows}，{percent}%）",
+                {"done": upserted, "total": total_rows, "percent": percent, "batch_ms": int((time.time() - t_batch) * 1000)},
             )
 
         self._append_document_log(
