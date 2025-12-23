@@ -69,3 +69,6 @@ logs/
 Thumbs.db
 .DS_Store
 
+# BGE 模型文件（文件太大，不应提交到 Git）
+CHARGE/models/pytorch_model.bin
+CHARGE/models/*.bin
