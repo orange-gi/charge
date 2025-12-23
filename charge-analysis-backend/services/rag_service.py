@@ -13,13 +13,14 @@ import json
 import time
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from openpyxl import load_workbook
 
 from config import get_settings
 from database import session_scope
-from models import KnowledgeCollection, KnowledgeDocument, RAGQuery
+from models import KnowledgeCollection, KnowledgeDocument, RAGQuery, RagDocumentLog, LogLevel
 from services.rag_cache import HybridCache
 from services.rag_normalize import extract_candidate_primary_tag, normalize_primary_tag_value, normalize_text
 from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts
@@ -84,6 +85,196 @@ class RagService:
                     (KnowledgeCollection.created_by == user_id) | (KnowledgeCollection.created_by.is_(None))
                 )
             return query.all()
+
+    def get_document(self, document_id: int) -> KnowledgeDocument | None:
+        with session_scope() as session:
+            return session.get(KnowledgeDocument, document_id)
+
+    def list_document_logs(self, document_id: int, limit: int = 200) -> Sequence[RagDocumentLog]:
+        with session_scope() as session:
+            return (
+                session.query(RagDocumentLog)
+                .filter(RagDocumentLog.document_id == document_id)
+                .order_by(RagDocumentLog.created_at.asc())
+                .limit(limit)
+                .all()
+            )
+
+    def _append_document_log(self, document_id: int, level: LogLevel, message: str, meta: dict | None = None) -> None:
+        try:
+            with session_scope() as session:
+                session.add(
+                    RagDocumentLog(
+                        document_id=document_id,
+                        log_level=level,
+                        message=message,
+                        meta_info=json.dumps(meta, ensure_ascii=False) if meta else None,
+                    )
+                )
+        except Exception:
+            # 日志写入失败不应阻塞主流程
+            return
+
+    def prepare_excel_document_upload(
+        self,
+        collection_id: int,
+        filename: str,
+        file_path: str,
+        file_size: int,
+        file_type: str,
+        user_id: int,
+        overwrite: bool = False,
+    ) -> KnowledgeDocument:
+        """创建/复用 KnowledgeDocument，并置为 processing。
+
+        真正的 Excel 解析与向量写入由后台任务执行（process_excel_document_by_id）。
+        """
+        with session_scope() as session:
+            collection = session.get(KnowledgeCollection, collection_id)
+            if collection is None:
+                raise ValueError("知识库不存在")
+
+            collection.chroma_collection_id = collection.chroma_collection_id or f"kc_{collection.id}"
+            collection.embedding_model = collection.embedding_model or "bge-base-zh-v1.5"
+            session.add(collection)
+            session.flush()
+            session.refresh(collection)
+
+            existing = (
+                session.query(KnowledgeDocument)
+                .filter(
+                    KnowledgeDocument.collection_id == collection_id,
+                    KnowledgeDocument.filename == filename,
+                )
+                .order_by(KnowledgeDocument.created_at.desc())
+                .first()
+            )
+            if existing is not None and not overwrite:
+                raise DocumentAlreadyExistsError("同名文档已存在，确认覆盖后再上传")
+
+            if existing is not None and overwrite:
+                # 覆盖：先尝试删除旧向量（失败不影响后续重建）
+                try:
+                    if collection.chroma_collection_id:
+                        self._vector.delete_by_document_id(collection.chroma_collection_id, existing.id)
+                except Exception:
+                    pass
+                document = existing
+            else:
+                document = KnowledgeDocument(
+                    collection_id=collection_id,
+                    filename=filename,
+                    file_path=file_path,
+                    file_size=file_size,
+                    file_type=file_type,
+                    upload_status="processing",
+                    uploaded_by=user_id,
+                )
+                session.add(document)
+                collection.document_count = (collection.document_count or 0) + 1
+                session.add(collection)
+
+            # 更新（覆盖/新建都要）
+            document.file_path = file_path
+            document.file_size = file_size
+            document.file_type = file_type
+            document.chunk_count = 0
+            document.upload_status = "processing"
+            document.processing_error = None
+            document.meta_info = None
+            document.content = (document.content or "")[:0]
+            session.add(document)
+
+            session.flush()
+            session.refresh(document)
+
+        self._append_document_log(document.id, LogLevel.INFO, "已接收文件，开始构建索引", {"filename": filename, "overwrite": overwrite})
+        return document
+
+    def process_excel_document_by_id(self, document_id: int) -> None:
+        """后台任务：根据 document_id 读取文件并构建索引（写入 Chroma）。"""
+        # 1) 读取文档与集合信息
+        with session_scope() as session:
+            doc = session.get(KnowledgeDocument, document_id)
+            if doc is None:
+                return
+            collection_id = int(doc.collection_id)
+            filename = doc.filename
+            file_path = doc.file_path
+            doc.upload_status = "processing"
+            doc.processing_error = None
+            session.add(doc)
+
+        self._append_document_log(document_id, LogLevel.INFO, "开始解析 Excel（第一个 Sheet）", {"file_path": file_path})
+
+        try:
+            raw_bytes = Path(file_path).read_bytes()
+        except Exception as exc:
+            err = f"读取文件失败：{exc}"
+            self._append_document_log(document_id, LogLevel.ERROR, err)
+            with session_scope() as session:
+                doc = session.get(KnowledgeDocument, document_id)
+                if doc:
+                    doc.upload_status = "failed"
+                    doc.processing_error = err
+                    session.add(doc)
+            return
+
+        try:
+            # 2) 构建向量索引
+            self._append_document_log(document_id, LogLevel.INFO, "正在构建向量索引（embedding + 写入向量库）")
+            report = self._index_excel_to_chroma(
+                chroma_collection_id=self._ensure_chroma_collection_id(collection_id),
+                document_id=document_id,
+                collection_id=collection_id,
+                filename=filename,
+                raw_bytes=raw_bytes,
+            )
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                "向量索引写入完成，正在更新文档状态",
+                {
+                    "rows_total": report.rows_total,
+                    "rows_indexed": report.rows_indexed,
+                    "rows_skipped_empty_tag": report.rows_skipped_empty_tag,
+                    "primary_tag_key": report.primary_tag_key,
+                    "primary_tag_unique": report.primary_tag_unique,
+                },
+            )
+
+            # 3) 更新文档记录
+            with session_scope() as session:
+                doc = session.get(KnowledgeDocument, document_id)
+                if doc is None:
+                    raise ValueError("文档不存在")
+                doc.chunk_count = report.rows_indexed
+                doc.upload_status = "completed"
+                doc.processing_error = None
+                doc.meta_info = json.dumps(
+                    {
+                        "primary_tag_key": report.primary_tag_key,
+                        "sheet_name": report.sheet_name,
+                        "rows_total": report.rows_total,
+                        "rows_indexed": report.rows_indexed,
+                        "rows_skipped_empty_tag": report.rows_skipped_empty_tag,
+                        "primary_tag_unique": report.primary_tag_unique,
+                    },
+                    ensure_ascii=False,
+                )
+                session.add(doc)
+
+            self._bump_collection_revision(collection_id)
+            self._append_document_log(document_id, LogLevel.INFO, "处理完成", {"status": "completed"})
+        except Exception as exc:
+            err = str(exc)
+            self._append_document_log(document_id, LogLevel.ERROR, f"处理失败：{err}")
+            with session_scope() as session:
+                doc = session.get(KnowledgeDocument, document_id)
+                if doc:
+                    doc.upload_status = "failed"
+                    doc.processing_error = err
+                    session.add(doc)
 
     def get_or_create_default_collection_for_user(self, user_id: int) -> KnowledgeCollection:
         """分析工作流默认用的知识库集合。

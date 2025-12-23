@@ -25,7 +25,13 @@ import * as XLSX from 'xlsx';
 import dayjs from 'dayjs';
 
 import { useAuthStore } from '../../stores/authStore';
-import { ragService, type KnowledgeCollection, type KnowledgeDocument, type RAGQueryRecord } from '../../services/ragService';
+import {
+  ragService,
+  type KnowledgeCollection,
+  type KnowledgeDocument,
+  type RAGQueryRecord,
+  type RagDocumentLog
+} from '../../services/ragService';
 
 const { Content, Sider } = Layout;
 const { Title, Text } = Typography;
@@ -142,6 +148,14 @@ const RagCenter: React.FC = () => {
 
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
+  // 上传进度/日志面板（仿训练进度“控制台”）
+  const [uploadConsoleOpen, setUploadConsoleOpen] = React.useState(false);
+  const [uploadDoc, setUploadDoc] = React.useState<KnowledgeDocument | null>(null);
+  const [uploadLogs, setUploadLogs] = React.useState<RagDocumentLog[]>([]);
+  const [uploadPolling, setUploadPolling] = React.useState(false);
+  const uploadPollTimerRef = React.useRef<number | null>(null);
+  const uploadConsoleRef = React.useRef<HTMLDivElement | null>(null);
+
   const [createModalOpen, setCreateModalOpen] = React.useState(false);
   const [creatingCollection, setCreatingCollection] = React.useState(false);
   const [createForm] = Form.useForm();
@@ -213,6 +227,22 @@ const RagCenter: React.FC = () => {
     loadDocuments();
     loadQueryHistory();
   }, [token, collectionId, loadDocuments, loadQueryHistory]);
+
+  React.useEffect(() => {
+    // 新日志到来后自动滚动到最底部
+    const el = uploadConsoleRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [uploadLogs.length, uploadConsoleOpen]);
+
+  React.useEffect(() => {
+    return () => {
+      if (uploadPollTimerRef.current) {
+        window.clearInterval(uploadPollTimerRef.current);
+        uploadPollTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const resetFile = () => {
     setSelectedFile(null);
@@ -310,13 +340,47 @@ const RagCenter: React.FC = () => {
       return;
     }
 
+    const startPollingUpload = (doc: KnowledgeDocument) => {
+      if (!collectionId) return;
+      if (uploadPollTimerRef.current) {
+        window.clearInterval(uploadPollTimerRef.current);
+        uploadPollTimerRef.current = null;
+      }
+      setUploadPolling(true);
+      uploadPollTimerRef.current = window.setInterval(async () => {
+        try {
+          const [latestDoc, logs] = await Promise.all([
+            ragService.getDocument(collectionId, doc.id, token!),
+            ragService.getDocumentLogs(collectionId, doc.id, token!, 400)
+          ]);
+          setUploadDoc(latestDoc);
+          setUploadLogs(logs);
+
+          const status = String(latestDoc.uploadStatus || '').toLowerCase();
+          if (status === 'completed' || status === 'failed') {
+            if (uploadPollTimerRef.current) {
+              window.clearInterval(uploadPollTimerRef.current);
+              uploadPollTimerRef.current = null;
+            }
+            setUploadPolling(false);
+            await loadCollections();
+            await loadDocuments();
+          }
+        } catch (e) {
+          // 轮询失败不打断用户
+        }
+      }, 1200);
+    };
+
     const doUpload = async (overwrite: boolean) => {
-      message.loading({ content: overwrite ? '覆盖并重建索引中...' : '上传并构建索引中...', key: 'ragUpload' });
-      await ragService.uploadDocument(collectionId, selectedFile, token!, { overwrite });
-      message.success({ content: overwrite ? '覆盖并重建索引成功' : '上传并构建索引成功', key: 'ragUpload' });
+      message.loading({ content: overwrite ? '上传中（覆盖）...' : '上传中...', key: 'ragUpload' });
+      const doc = await ragService.uploadDocument(collectionId, selectedFile, token!, { overwrite });
+      message.success({ content: '文件已接收，正在后台构建索引…', key: 'ragUpload' });
+      setUploadDoc(doc);
+      setUploadLogs([]);
+      setUploadConsoleOpen(true);
+      startPollingUpload(doc);
       resetFile();
-      await loadCollections(); // 更新 doc_count
-      await loadDocuments();
     };
 
     Modal.confirm({
@@ -762,6 +826,85 @@ const RagCenter: React.FC = () => {
             <Input.TextArea rows={3} placeholder="简单描述该知识库用途" maxLength={2000} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="文档上传与索引进度"
+        open={uploadConsoleOpen}
+        onCancel={() => {
+          setUploadConsoleOpen(false);
+        }}
+        footer={[
+          <Button
+            key="close"
+            onClick={() => {
+              setUploadConsoleOpen(false);
+            }}
+          >
+            关闭
+          </Button>
+        ]}
+        width={860}
+      >
+        {!uploadDoc ? (
+          <Empty description="暂无任务" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        ) : (
+          <Space direction="vertical" style={{ width: '100%' }} size="middle">
+            <Descriptions bordered size="small" column={2}>
+              <Descriptions.Item label="文件">{uploadDoc.filename}</Descriptions.Item>
+              <Descriptions.Item label="文档ID">{uploadDoc.id}</Descriptions.Item>
+              <Descriptions.Item label="状态">
+                <Tag
+                  color={
+                    uploadDoc.uploadStatus === 'completed'
+                      ? 'green'
+                      : uploadDoc.uploadStatus === 'failed'
+                        ? 'red'
+                        : 'blue'
+                  }
+                >
+                  {uploadDoc.uploadStatus}
+                </Tag>
+                {uploadPolling && <Tag color="gold">轮询中</Tag>}
+              </Descriptions.Item>
+              <Descriptions.Item label="Chunk">
+                {typeof uploadDoc.chunkCount === 'number' ? uploadDoc.chunkCount : '-'}
+              </Descriptions.Item>
+              {uploadDoc.processingError && (
+                <Descriptions.Item label="错误" span={2}>
+                  <Text type="danger">{uploadDoc.processingError}</Text>
+                </Descriptions.Item>
+              )}
+            </Descriptions>
+
+            <Card size="small" title="处理日志（实时刷新）">
+              {uploadLogs.length === 0 ? (
+                <Empty description="暂无日志" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              ) : (
+                <div className="console-log" ref={uploadConsoleRef}>
+                  {uploadLogs.map((item) => {
+                    const level = String(item.logLevel || '').toLowerCase();
+                    const levelClass =
+                      level.includes('error') || level.includes('critical')
+                        ? 'level-error'
+                        : level.includes('warn')
+                          ? 'level-warn'
+                          : level.includes('debug')
+                            ? 'level-debug'
+                            : 'level-info';
+                    return (
+                      <div key={item.id} className="console-log-line">
+                        <span className="console-log-time">{dayjs(item.createdAt).format('HH:mm:ss')}</span>
+                        <span className={`console-log-level ${levelClass}`}>{item.logLevel}</span>
+                        <span className="console-log-message">{item.message}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Card>
+          </Space>
+        )}
       </Modal>
     </Card>
   );

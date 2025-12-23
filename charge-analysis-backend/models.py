@@ -196,6 +196,27 @@ class KnowledgeDocument(Base):
     # 关系
     collection = relationship("KnowledgeCollection", back_populates="documents")
     uploaded_by_user = relationship("User", back_populates="documents")
+    rag_logs = relationship(
+        "RagDocumentLog",
+        back_populates="document",
+        cascade="all, delete-orphan",
+        order_by="RagDocumentLog.created_at",
+    )
+
+
+class RagDocumentLog(Base):
+    """RAG 文档处理日志（用于前端展示处理过程）。"""
+
+    __tablename__ = "rag_document_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("knowledge_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    log_level = Column(Enum(LogLevel), default=LogLevel.INFO, nullable=False)
+    message = Column(Text, nullable=False)
+    meta_info = Column(Text)  # JSON
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    document = relationship("KnowledgeDocument", back_populates="rag_logs")
 
 
 class RAGQuery(Base):

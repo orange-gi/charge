@@ -363,6 +363,27 @@ class KnowledgeDocumentRead(BaseModel):
     )
 
 
+class RagDocumentLogRead(BaseModel):
+    id: int
+    document_id: int
+    log_level: str
+    message: str
+    created_at: datetime
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "document_id": 18,
+                "log_level": "INFO",
+                "message": "开始解析 Excel（第一个 Sheet）",
+                "created_at": "2024-12-11T08:10:00.000Z",
+            }
+        },
+    )
+
+
 class RagQueryRecord(BaseModel):
     id: int
     collection_id: int
