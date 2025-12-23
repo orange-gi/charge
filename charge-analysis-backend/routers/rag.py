@@ -28,8 +28,14 @@ def create_collection(
     ),
     user: User = Depends(get_current_user),
 ) -> RagCollectionRead:
-    collection = rag_service.create_collection(payload.name, payload.description, user.id)
-    return RagCollectionRead.model_validate(collection)
+    try:
+        collection = rag_service.create_collection(payload.name, payload.description, user.id)
+        return RagCollectionRead.model_validate(collection)
+    except ValueError as exc:
+        # 例如 chroma_collection_id 为空/非法
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"创建知识库失败：{exc}") from exc
 
 
 @router.get("/collections", response_model=list[RagCollectionRead])

@@ -60,12 +60,16 @@ class RagService:
             session.add(collection)
             session.flush()
             # 绑定稳定的 chroma_collection_id（避免名称变更导致索引丢失）
-            collection.chroma_collection_id = collection.chroma_collection_id or f"kc_{collection.id}"
+            if collection.id is None:
+                # 正常情况下 flush 后一定有主键；若没有，说明 DB 底层异常
+                raise RuntimeError("知识库创建失败：未分配主键")
+            chroma_id = collection.chroma_collection_id or f"kc_{collection.id}"
+            collection.chroma_collection_id = chroma_id
             collection.embedding_model = collection.embedding_model or "bge-base-zh-v1.5"
             session.add(collection)
             session.refresh(collection)
             # 确保 Chroma collection 存在
-            self._vector.get_or_create_collection(collection.chroma_collection_id)
+            self._vector.get_or_create_collection(chroma_id)
             return collection
 
     def get_collection(self, collection_id: int) -> KnowledgeCollection | None:
