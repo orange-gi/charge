@@ -24,6 +24,8 @@ class ChromaVectorStore:
         self._client = chromadb.PersistentClient(path=str(settings.chroma_persist_directory))
 
     def get_or_create_collection(self, chroma_collection_id: str) -> Collection:
+        if not chroma_collection_id or not isinstance(chroma_collection_id, str):
+            raise ValueError("chroma_collection_id 不能为空")
         try:
             return self._client.get_collection(name=chroma_collection_id)
         except Exception:
