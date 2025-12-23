@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -24,6 +25,8 @@ from models import KnowledgeCollection, KnowledgeDocument, RAGQuery, RagDocument
 from services.rag_cache import HybridCache
 from services.rag_normalize import extract_candidate_primary_tag, normalize_primary_tag_value, normalize_text
 from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentAlreadyExistsError(RuntimeError):
@@ -101,6 +104,21 @@ class RagService:
             )
 
     def _append_document_log(self, document_id: int, level: LogLevel, message: str, meta: dict | None = None) -> None:
+        # 同步输出到后端日志（便于在服务端排查，不依赖前端）
+        try:
+            meta_str = json.dumps(meta, ensure_ascii=False) if meta else ""
+        except Exception:
+            meta_str = ""
+        lvl = str(level.value if hasattr(level, "value") else level).upper()
+        if lvl == "DEBUG":
+            logger.debug("[RAG][doc=%s] %s %s", document_id, message, meta_str)
+        elif lvl == "WARNING":
+            logger.warning("[RAG][doc=%s] %s %s", document_id, message, meta_str)
+        elif lvl in {"ERROR", "CRITICAL"}:
+            logger.error("[RAG][doc=%s] %s %s", document_id, message, meta_str)
+        else:
+            logger.info("[RAG][doc=%s] %s %s", document_id, message, meta_str)
+
         try:
             with session_scope() as session:
                 session.add(
@@ -156,8 +174,16 @@ class RagService:
                 # 覆盖：先尝试删除旧向量（失败不影响后续重建）
                 try:
                     if collection.chroma_collection_id:
+                        self._append_document_log(
+                            existing.id,
+                            LogLevel.INFO,
+                            "检测到覆盖上传：准备删除旧向量索引",
+                            {"chroma_collection_id": collection.chroma_collection_id},
+                        )
                         self._vector.delete_by_document_id(collection.chroma_collection_id, existing.id)
+                        self._append_document_log(existing.id, LogLevel.INFO, "旧向量索引删除完成")
                 except Exception:
+                    self._append_document_log(existing.id, LogLevel.WARNING, "删除旧向量索引失败（将继续重建）")
                     pass
                 document = existing
             else:
@@ -188,11 +214,17 @@ class RagService:
             session.flush()
             session.refresh(document)
 
-        self._append_document_log(document.id, LogLevel.INFO, "已接收文件，开始构建索引", {"filename": filename, "overwrite": overwrite})
+        self._append_document_log(
+            document.id,
+            LogLevel.INFO,
+            "已接收文件，准备后台构建索引",
+            {"filename": filename, "file_path": file_path, "file_size": file_size, "overwrite": overwrite},
+        )
         return document
 
     def process_excel_document_by_id(self, document_id: int) -> None:
         """后台任务：根据 document_id 读取文件并构建索引（写入 Chroma）。"""
+        start_all = time.time()
         # 1) 读取文档与集合信息
         with session_scope() as session:
             doc = session.get(KnowledgeDocument, document_id)
@@ -205,10 +237,22 @@ class RagService:
             doc.processing_error = None
             session.add(doc)
 
-        self._append_document_log(document_id, LogLevel.INFO, "开始解析 Excel（第一个 Sheet）", {"file_path": file_path})
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "开始处理任务",
+            {"collection_id": collection_id, "filename": filename, "file_path": file_path},
+        )
 
         try:
+            t0 = time.time()
             raw_bytes = Path(file_path).read_bytes()
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                "文件读取完成",
+                {"bytes": len(raw_bytes), "elapsed_ms": int((time.time() - t0) * 1000)},
+            )
         except Exception as exc:
             err = f"读取文件失败：{exc}"
             self._append_document_log(document_id, LogLevel.ERROR, err)
@@ -222,13 +266,20 @@ class RagService:
 
         try:
             # 2) 构建向量索引
-            self._append_document_log(document_id, LogLevel.INFO, "正在构建向量索引（embedding + 写入向量库）")
+            self._append_document_log(document_id, LogLevel.INFO, "开始解析 Excel（第一个 Sheet）")
+            t_index = time.time()
             report = self._index_excel_to_chroma(
                 chroma_collection_id=self._ensure_chroma_collection_id(collection_id),
                 document_id=document_id,
                 collection_id=collection_id,
                 filename=filename,
                 raw_bytes=raw_bytes,
+            )
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                "Excel 解析 + 向量写入完成",
+                {"elapsed_ms": int((time.time() - t_index) * 1000)},
             )
             self._append_document_log(
                 document_id,
@@ -265,10 +316,20 @@ class RagService:
                 session.add(doc)
 
             self._bump_collection_revision(collection_id)
-            self._append_document_log(document_id, LogLevel.INFO, "处理完成", {"status": "completed"})
+            self._append_document_log(
+                document_id,
+                LogLevel.INFO,
+                "处理完成",
+                {"status": "completed", "total_elapsed_ms": int((time.time() - start_all) * 1000)},
+            )
         except Exception as exc:
             err = str(exc)
-            self._append_document_log(document_id, LogLevel.ERROR, f"处理失败：{err}")
+            self._append_document_log(
+                document_id,
+                LogLevel.ERROR,
+                "处理失败",
+                {"error": err, "total_elapsed_ms": int((time.time() - start_all) * 1000)},
+            )
             with session_scope() as session:
                 doc = session.get(KnowledgeDocument, document_id)
                 if doc:
@@ -449,9 +510,17 @@ class RagService:
         filename: str,
         raw_bytes: bytes,
     ) -> ExcelIndexReport:
+        t0 = time.time()
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "开始加载 Excel 工作簿",
+            {"bytes": len(raw_bytes), "chroma_collection_id": chroma_collection_id},
+        )
         wb = load_workbook(filename=BytesIO(raw_bytes), read_only=True, data_only=True)
         ws = wb.worksheets[0]
         sheet_name = ws.title
+        self._append_document_log(document_id, LogLevel.INFO, "已打开 Excel（第一个 Sheet）", {"sheet_name": sheet_name})
 
         rows_iter = ws.iter_rows(values_only=True)
         header_row = next(rows_iter, None)
@@ -462,6 +531,12 @@ class RagService:
         if not headers or not headers[0]:
             headers = [f"列{i+1}" for i in range(len(header_row))]
         primary_tag_key = headers[0] or "主标签"
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "表头解析完成",
+            {"primary_tag_key": primary_tag_key, "header_count": len(headers)},
+        )
 
         ids: list[str] = []
         docs: list[str] = []
@@ -518,7 +593,28 @@ class RagService:
         if rows_indexed == 0:
             raise ValueError("未索引任何有效行（可能第一列全为空）")
 
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "Excel 行读取完成，准备 embedding",
+            {
+                "rows_total": rows_total,
+                "rows_indexed": rows_indexed,
+                "rows_skipped_empty_tag": rows_skipped_empty_tag,
+                "primary_tag_unique": len(primary_values),
+            },
+        )
+
+        t_embed = time.time()
         embeddings = embed_texts(docs)
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "embedding 完成，准备写入向量库",
+            {"rows": len(docs), "elapsed_ms": int((time.time() - t_embed) * 1000)},
+        )
+
+        t_upsert = time.time()
         self._vector.upsert(
             chroma_collection_id=chroma_collection_id,
             ids=ids,
@@ -526,10 +622,23 @@ class RagService:
             metadatas=metas,
             embeddings=embeddings,
         )
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "向量库写入完成",
+            {"rows": len(docs), "elapsed_ms": int((time.time() - t_upsert) * 1000)},
+        )
         try:
             wb.close()
         except Exception:
             pass
+
+        self._append_document_log(
+            document_id,
+            LogLevel.INFO,
+            "索引构建阶段结束",
+            {"elapsed_ms": int((time.time() - t0) * 1000)},
+        )
 
         return ExcelIndexReport(
             primary_tag_key=primary_tag_key,
