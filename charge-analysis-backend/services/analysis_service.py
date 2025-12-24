@@ -368,12 +368,22 @@ class AnalysisService:
             "validation_message": _serialize(state.get("validation_message")),
             "parsing_status": _serialize(state.get("parsing_status")),
             "flow_analysis": _serialize(state.get("flow_analysis")),
+            # 流程控制：关键信号规则处理产物
+            "signal_windows": _serialize(state.get("signal_windows")),
+            "signal_windows_list": _serialize(state.get("signal_windows_list")),
+            "signal_rule_meta": _serialize(state.get("signal_rule_meta")),
+            "rag_queries": _serialize(state.get("rag_queries")),
             "llm_analysis": _serialize(state.get("llm_analysis")),
+            # 细化分析（循环）产物
+            "refine_result": _serialize(state.get("refine_result")),
+            "refine_confidence": _serialize(state.get("refine_confidence")),
+            "additional_signals": _serialize(state.get("additional_signals")),
             "data_stats": _serialize(state.get("data_stats")),
             "parsed_data": _serialize(state.get("parsed_data_records")),
             "raw_messages": _serialize(state.get("raw_messages")),  # 添加原始消息数据
             "selected_signals": _serialize(state.get("selected_signals")),  # 保存选择的信号列表
             "retrieved_documents": _serialize(state.get("retrieved_documents")),
+            "retrieval_by_query": _serialize(state.get("retrieval_by_query")),
             "final_report": _serialize(state.get("final_report")),
             "refined_signals": _serialize(state.get("refined_signals")),
             "signal_validation": _serialize(state.get("signal_validation")),
