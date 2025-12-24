@@ -63,17 +63,29 @@ class ChargingAnalysisState(TypedDict):
     flow_analysis: Optional[Dict[str, Any]]
     problem_direction: Optional[str]
     confidence_score: Optional[float]
+
+    # 流程控制：关键信号规则处理（用于循环细化）
+    signals_to_process: Optional[List[str]]  # 本轮需要按“时间段->值”处理的信号
+    processed_signals: Optional[List[str]]  # 已处理过的信号（规范化后小写）
+    signal_windows: Optional[Dict[str, Dict[str, str]]]  # signal_name -> { "HH:MM:SS-HH:MM:SS": "value" }
+    signal_windows_list: Optional[List[Dict[str, Dict[str, str]]]]  # 兼容前端：[{signal:{...}}, ...]
+    signal_rule_meta: Optional[Dict[str, Any]]  # 枚举释义等元信息
+    rag_queries: Optional[List[Dict[str, Any]]]  # [{signal,value,query,intervals:[...]}, ...]
     
     # RAG检索
     retrieved_documents: Optional[List[Dict[str, Any]]]
     retrieval_context: Optional[str]
     retrieval_status: Optional[str]
+    retrieval_by_query: Optional[Dict[str, List[Dict[str, Any]]]]  # query -> filtered docs(score>=0.7)
     
     # 细化分析
     iteration: int
     refined_signals: Optional[List[str]]
     signal_validation: Optional[Dict[str, Any]]
     analysis_status: AnalysisStatus
+    refine_result: Optional[Dict[str, Any]]  # {conclusion, confidence, needed_signals}
+    refine_confidence: Optional[float]
+    additional_signals: Optional[List[str]]  # 下一轮建议补充的信号（原始名称）
     
     # 最终结果
     llm_analysis: Optional[Dict[str, Any]]
@@ -106,8 +118,17 @@ def _ensure_trace_entry(state: ChargingAnalysisState, node_id: str) -> Dict[str,
 
 def mark_node_started(state: ChargingAnalysisState, node_id: str, description: str | None = None, metadata: Dict[str, Any] | None = None) -> None:
     entry = _ensure_trace_entry(state, node_id)
-    if "started_at" not in entry:
-        entry["started_at"] = _iso_now()
+    now = _iso_now()
+    # 支持同一节点多次执行（循环）：记录 runs 列表，前端可展示“细化分析→流程控制”的回环
+    runs = entry.setdefault("runs", [])
+    current_run = {"started_at": now, "status": "running"}
+    if description:
+        current_run["description"] = description
+    if metadata:
+        current_run["metadata"] = metadata
+    entry["current_run"] = current_run
+    # 兼容旧前端：仍保留顶层 started_at/ended_at/status/output 为“最后一次执行”
+    entry["started_at"] = now
     entry["status"] = "running"
     if description:
         entry["description"] = description
@@ -117,17 +138,33 @@ def mark_node_started(state: ChargingAnalysisState, node_id: str, description: s
 
 def mark_node_completed(state: ChargingAnalysisState, node_id: str, output: Dict[str, Any] | None = None) -> None:
     entry = _ensure_trace_entry(state, node_id)
+    now = _iso_now()
     entry["status"] = "completed"
-    entry["ended_at"] = _iso_now()
+    entry["ended_at"] = now
     if output is not None:
         entry["output"] = output
+    # 写入本次 run
+    current = entry.pop("current_run", None)
+    if isinstance(current, dict):
+        current["status"] = "completed"
+        current["ended_at"] = now
+        if output is not None:
+            current["output"] = output
+        entry.setdefault("runs", []).append(current)
 
 
 def mark_node_failed(state: ChargingAnalysisState, node_id: str, error_message: str) -> None:
     entry = _ensure_trace_entry(state, node_id)
+    now = _iso_now()
     entry["status"] = "failed"
-    entry["ended_at"] = _iso_now()
+    entry["ended_at"] = now
     entry["error"] = error_message
+    current = entry.pop("current_run", None)
+    if isinstance(current, dict):
+        current["status"] = "failed"
+        current["ended_at"] = now
+        current["error"] = error_message
+        entry.setdefault("runs", []).append(current)
 
 
 def create_initial_workflow_trace(file_name: str, file_size: int | None, created_at: datetime | None = None) -> Dict[str, Any]:
@@ -564,47 +601,248 @@ class MessageParsingNode:
 
 class FlowControlModelNode:
     """流程控制模型节点"""
-    
+
+    _KEY_SIGNALS = [
+        "DCChrgSt",
+        "BMS_ChrgEndNum",
+        "BMS_FaultNum1",
+        "VIU0_FaultNum1",
+        "CHM_ComVersion",
+    ]
+
+    _DCCHRGST_ENUM = {
+        0x0: "Off 未插枪",
+        0x1: "Init 初始化",
+        0x2: "Standby 待机",
+        0x3: "Charging 充电中",
+        0x4: "CHGEnd 充电终止",
+        0x5: "PreHeat 预热",
+        0x6: "Fault 充电异常终止",
+        0x7: "Schedule 预约",
+        0x8: "Power supply mode 供电模式",
+        0x9: "EmergencyStop 紧急结束",
+    }
+
+    _CHM_COMVERSION_ENUM = {
+        257: "2015国标桩",
+        16777215: "无效值",
+        5456689: "湾区协议",
+        2313: "特来电",
+        480: "蔚来私有桩",
+    }
+
+    _TIME_COLUMNS = ["ts", "timestamp", "time", "Time"]
+
+    def _normalize_name(self, name: str) -> str:
+        return (name or "").strip().lower()
+
+    def _find_column_case_insensitive(self, df: pd.DataFrame, target: str) -> str | None:
+        want = self._normalize_name(target)
+        for col in df.columns:
+            if self._normalize_name(str(col)) == want:
+                return str(col)
+        return None
+
+    def _coerce_int(self, v: Any) -> int | None:
+        if v is None:
+            return None
+        try:
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, (int,)):
+                return int(v)
+            if isinstance(v, float):
+                if math.isnan(v) or math.isinf(v):
+                    return None
+                return int(v)
+            s = str(v).strip()
+            if not s:
+                return None
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            # 有些解析器会输出 "1.0"
+            if "." in s:
+                f = float(s)
+                if math.isnan(f) or math.isinf(f):
+                    return None
+                return int(f)
+            return int(s)
+        except Exception:
+            return None
+
+    def _format_hms(self, ts: Any) -> str:
+        try:
+            t = pd.to_datetime(ts, errors="coerce")
+            if pd.isna(t):
+                return ""
+            # 只保留 HH:MM:SS
+            return t.strftime("%H:%M:%S")
+        except Exception:
+            return ""
+
+    def _get_time_series(self, df: pd.DataFrame) -> pd.Series | None:
+        for col in self._TIME_COLUMNS:
+            if col in df.columns:
+                return df[col]
+        return None
+
+    def _build_value_windows(self, df: pd.DataFrame, signal_col: str) -> Dict[str, str]:
+        """将信号序列切分为时间段->值（字符串）。解析不出来就返回空 dict，不报错。"""
+        if df is None or df.empty or signal_col not in df.columns:
+            return {}
+        ts_series = self._get_time_series(df)
+        if ts_series is None:
+            return {}
+
+        # 只取时间与该信号，按时间排序
+        tmp = pd.DataFrame({"_ts": ts_series, "_v": df[signal_col]})
+        tmp["_ts"] = pd.to_datetime(tmp["_ts"], errors="coerce")
+        tmp = tmp.dropna(subset=["_ts"])
+        if tmp.empty:
+            return {}
+        tmp = tmp.sort_values("_ts", kind="mergesort")
+        # 丢掉空值
+        tmp = tmp.dropna(subset=["_v"])
+        if tmp.empty:
+            return {}
+
+        windows: Dict[str, str] = {}
+        run_start = tmp.iloc[0]["_ts"]
+        last_ts = tmp.iloc[0]["_ts"]
+        last_raw = tmp.iloc[0]["_v"]
+
+        def _val_str(x: Any) -> str:
+            iv = self._coerce_int(x)
+            if iv is None:
+                # 保底：原样字符串
+                return str(x)
+            return str(iv)
+
+        last_val = _val_str(last_raw)
+        for i in range(1, len(tmp)):
+            row = tmp.iloc[i]
+            cur_ts = row["_ts"]
+            cur_val = _val_str(row["_v"])
+            if cur_val != last_val:
+                start_s = self._format_hms(run_start)
+                end_s = self._format_hms(cur_ts)
+                if start_s and end_s:
+                    windows[f"{start_s}-{end_s}"] = last_val
+                run_start = cur_ts
+                last_val = cur_val
+            last_ts = cur_ts
+
+        # 末段
+        start_s = self._format_hms(run_start)
+        end_s = self._format_hms(last_ts)
+        if start_s and end_s:
+            windows[f"{start_s}-{end_s}"] = last_val
+        return windows
+
+    def _build_rag_query(self, signal: str, value: str) -> str:
+        # 针对你给的知识库示例做一点“更容易命中”的模板
+        norm = self._normalize_name(signal)
+        if norm == "bms_chrgendnum":
+            return f"停充码ChrgEndNum 8bit={value}"
+        # 其余信号先用通用格式
+        return f"{signal}={value}"
+
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
-        """处理流程控制模型分析"""
+        """处理流程控制：关键信号规则化 + 构建 RAG 查询。"""
         df = state.get('parsed_data')
         stats = state.get('data_stats')
-        mark_node_started(state, "flow_control", "流程控制模型分析")
+        iteration = int(state.get("iteration") or 0)
+        mark_node_started(state, "flow_control", f"流程控制规则处理（第{iteration + 1}轮）", {"iteration": iteration})
         
         if df is None or stats is None:
-            raise ValueError("缺少解析数据")
+            failed_state = {**state, "error_message": "缺少解析数据"}
+            mark_node_failed(failed_state, "flow_control", "缺少解析数据")
+            return failed_state
         
         try:
             if state.get('progress_callback'):
                 await state['progress_callback']("流程分析", 50, "流程控制模型分析中...")
-            
-            # 构建输入提示
-            prompt = self._build_prompt(stats)
-            
-            # 模拟模型推理
-            result = await self._model_inference(prompt)
-            
-            # 解析结果
-            analysis_result = self._parse_model_output(result)
-            
+
+            # 本轮要处理哪些信号：优先 signals_to_process（循环时由细化分析给出），否则默认5个关键
+            signals_to_process = state.get("signals_to_process") or list(self._KEY_SIGNALS)
+            processed = set(state.get("processed_signals") or [])
+
+            signal_windows: Dict[str, Dict[str, str]] = dict(state.get("signal_windows") or {})
+            signal_windows_list: List[Dict[str, Dict[str, str]]] = list(state.get("signal_windows_list") or [])
+            rule_meta: Dict[str, Any] = dict(state.get("signal_rule_meta") or {})
+
+            # 生成 windows + 枚举释义
+            newly_processed_norm: List[str] = []
+            for sig in signals_to_process:
+                if not sig:
+                    continue
+                sig_norm = self._normalize_name(sig)
+                if sig_norm in processed:
+                    continue
+                col = self._find_column_case_insensitive(df, sig)
+                if not col:
+                    continue
+                windows = self._build_value_windows(df, col)
+                if not windows:
+                    continue
+                # 使用“实际列名”作为 key（便于前端对齐 DataFrame 列）
+                signal_windows[col] = windows
+                signal_windows_list.append({col: windows})
+                newly_processed_norm.append(sig_norm)
+
+                # 枚举释义（可选，用于 LLM/前端展示）
+                if sig_norm == "dcchrgst":
+                    rule_meta[col] = {"enum": {str(k): v for k, v in self._DCCHRGST_ENUM.items()}}
+                elif sig_norm == "chm_comversion":
+                    rule_meta[col] = {"enum": {str(k): v for k, v in self._CHM_COMVERSION_ENUM.items()}, "default": "未知充电桩"}
+
+            processed.update(newly_processed_norm)
+
+            # 构建 rag_queries（按“信号-值”去重，避免一个信号很多段导致爆炸）
+            rag_queries: List[Dict[str, Any]] = []
+            for sig_name, windows in signal_windows.items():
+                # 只针对本轮新增/关键处理的信号做查询：这里选择对所有已处理信号都可查询，但做去重
+                value_to_intervals: Dict[str, List[str]] = {}
+                for interval, val in (windows or {}).items():
+                    value_to_intervals.setdefault(str(val), []).append(str(interval))
+                for val, intervals in value_to_intervals.items():
+                    q = self._build_rag_query(sig_name, val)
+                    rag_queries.append({"signal": sig_name, "value": str(val), "query": q, "intervals": intervals})
+
+            # 仍保留原来 flow_analysis 的字段，避免前端/结果结构断裂
+            analysis_result = {
+                "handled_signal_count": len(signal_windows),
+                "handled_signals": list(signal_windows.keys()),
+                "iteration": iteration + 1,
+            }
+
             if state.get('progress_callback'):
-                await state['progress_callback']("流程分析", 60, "流程分析完成")
-            
+                await state['progress_callback']("流程分析", 60, f"流程分析完成（已规则化{len(signal_windows)}个信号）")
+
             result_state = {
                 **state,
-                'flow_analysis': analysis_result,
-                'problem_direction': analysis_result.get('problem_direction', 'general_analysis'),
-                'confidence_score': analysis_result.get('confidence', 0.0)
+                "flow_analysis": analysis_result,
+                "problem_direction": (state.get("problem_direction") or "general_analysis"),
+                "confidence_score": float(state.get("confidence_score") or 0.0),
+                "signals_to_process": signals_to_process,
+                "processed_signals": sorted(processed),
+                "signal_windows": signal_windows,
+                "signal_windows_list": signal_windows_list,
+                "signal_rule_meta": rule_meta,
+                "rag_queries": rag_queries,
             }
-            mark_node_completed(result_state, "flow_control", analysis_result)
+            mark_node_completed(result_state, "flow_control", {
+                "iteration": iteration + 1,
+                "signals_requested": len(signals_to_process),
+                "signals_processed_total": len(signal_windows),
+                "rag_query_count": len(rag_queries),
+            })
             return result_state
             
         except Exception as e:
-            logger.error(f"流程控制模型分析失败: {str(e)}")
+            logger.error(f"流程控制处理失败: {str(e)}")
             failed_state = {
                 **state,
-                'problem_direction': 'general_analysis',
-                'confidence_score': 0.5,
                 'error_message': str(e)
             }
             mark_node_failed(failed_state, "flow_control", str(e))
@@ -688,44 +926,65 @@ class RAGRetrievalNode:
         """处理RAG检索"""
         problem_direction = state.get('problem_direction', '')
         df = state.get('parsed_data')
-        mark_node_started(state, "rag_retrieval", "检索知识库")
+        rag_queries = state.get("rag_queries") or []
+        iteration = int(state.get("iteration") or 0)
+        mark_node_started(state, "rag_retrieval", f"检索知识库（第{iteration + 1}轮）", {"iteration": iteration, "query_count": len(rag_queries)})
         
         try:
             if state.get('progress_callback'):
                 await state['progress_callback']("知识检索", 70, "RAG知识检索中...")
             
-            # 构建检索查询
-            query = self._build_retrieval_query(problem_direction, df)
+            # 优先使用流程控制生成的多查询；否则回退到旧逻辑（单查询）
+            queries: List[str] = []
+            if rag_queries:
+                queries = [str(item.get("query") or "") for item in rag_queries if str(item.get("query") or "").strip()]
+            else:
+                query = self._build_retrieval_query(problem_direction, df)
+                queries = [query]
+
             # 选择默认知识库（与 RAG 管理页一致：优先用户库，否则公共库）
             user_id = state.get("user_id")
             if not user_id:
                 raise ValueError("缺少 user_id，无法选择知识库")
 
             collection = await asyncio.to_thread(self._rag_service.get_or_create_default_collection_for_user, int(user_id))
-            # 检索相关条目（检索-only，返回证据链）
-            result = await asyncio.to_thread(
-                self._rag_service.query,
-                collection.id,
-                query,
-                int(user_id),
-                5,
-                True,
-            )
-            documents = result.get("documents") or []
-            context = self._build_context(documents)
+            retrieval_by_query: Dict[str, List[Dict[str, Any]]] = {}
+            all_documents: List[Dict[str, Any]] = []
+            # 阈值：只保留相似度 >= 0.7
+            threshold = 0.7
+
+            for q in queries:
+                if not q:
+                    continue
+                result = await asyncio.to_thread(
+                    self._rag_service.query,
+                    collection.id,
+                    q,
+                    int(user_id),
+                    5,
+                    True,
+                )
+                docs = result.get("documents") or []
+                filtered = [d for d in docs if float(d.get("score") or 0.0) >= threshold]
+                retrieval_by_query[q] = filtered
+                all_documents.extend(filtered)
+
+            context = self._build_context(all_documents)
             
             if state.get('progress_callback'):
                 await state['progress_callback']("知识检索", 80, "知识检索完成")
             
             result_state = {
                 **state,
-                'retrieved_documents': documents,
+                'retrieved_documents': all_documents,
                 'retrieval_context': context,
-                'retrieval_status': 'completed'
+                'retrieval_status': 'completed',
+                "retrieval_by_query": retrieval_by_query,
             }
             mark_node_completed(result_state, "rag_retrieval", {
-                "document_count": len(documents),
-                "query": query
+                "document_count": len(all_documents),
+                "query_count": len([q for q in queries if q]),
+                "threshold": threshold,
             })
             return result_state
             
@@ -779,14 +1038,25 @@ class DetailedAnalysisNode:
     
     def __init__(self):
         self.max_iterations = 3
+        # 复用 OpenAI 配置（有则用，无则 mock）
+        from config import get_settings
+        settings = get_settings()
+        self._model_name = getattr(settings, "llm_model_name", None)
+        self._llm_client = None
+        if getattr(settings, "openai_api_key", None) and getattr(settings, "openai_base_url", None):
+            try:
+                from openai import AsyncOpenAI
+                self._llm_client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+            except Exception:
+                self._llm_client = None
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
         """处理细化分析"""
         problem_direction = state.get('problem_direction', '')
         context = state.get('retrieval_context', '')
         df = state.get('parsed_data')
-        iteration = state.get('iteration', 0)
-        mark_node_started(state, "detailed_analysis", f"细化分析第{iteration + 1}次", {"iteration": iteration})
+        iteration = int(state.get('iteration', 0) or 0)
+        mark_node_started(state, "detailed_analysis", f"细化分析（第{iteration + 1}轮）", {"iteration": iteration})
         
         if iteration >= self.max_iterations:
             if state.get('progress_callback'):
@@ -805,48 +1075,48 @@ class DetailedAnalysisNode:
         
         try:
             if state.get('progress_callback'):
-                await state['progress_callback']("细化分析", 85, f"细化分析第{iteration+1}次")
-            
-            # 提取细化信号
-            refined_signals = await self._extract_refined_signals(
-                problem_direction, context, df
-            )
-            
-            # 验证信号
+                await state['progress_callback']("细化分析", 85, f"细化分析（第{iteration+1}轮）")
+
+            # 1) 先用“已有数据列+问题方向”给出一个基础候选信号集（兜底）
+            refined_signals = await self._extract_refined_signals(problem_direction, context, df)
             signal_validation = await self._validate_signals(df, refined_signals)
-            
-            # 如果验证失败，尝试下一个迭代
-            if not signal_validation['validated']:
-                pending_state = {
-                    **state,
-                    'iteration': iteration + 1,
-                    'refined_signals': refined_signals,
-                    'signal_validation': signal_validation,
-                    'next_step': 'flow_control_retry'
-                }
-                entry = _ensure_trace_entry(pending_state, "detailed_analysis")
-                entry["status"] = "running"
-                entry["output"] = {
-                    "validated": False,
-                    "iteration": iteration + 1,
-                    "signal_count": signal_validation.get('signal_count'),
-                    "average_quality": signal_validation.get('average_quality'),
-                }
-                return pending_state
-            
+
+            # 2) 把流程控制生成的“时间段->值”和 RAG 证据统一交给 LLM 细化分析，产出置信度与“需要更多哪些信号”
+            windows_list = state.get("signal_windows_list") or []
+            rule_meta = state.get("signal_rule_meta") or {}
+            retrieval_by_query = state.get("retrieval_by_query") or {}
+            refine = await self._llm_refine(problem_direction, windows_list, rule_meta, retrieval_by_query, signal_validation)
+            refine_conf = float(refine.get("confidence") or 0.0)
+            needed = refine.get("needed_signals") or []
+            if not isinstance(needed, list):
+                needed = []
+            needed = [str(x) for x in needed if str(x).strip()]
+
             if state.get('progress_callback'):
-                await state['progress_callback']("细化分析", 90, "细化分析验证通过")
-            
+                await state['progress_callback']("细化分析", 90, f"细化分析完成（置信度{refine_conf:.0%}）")
+
+            # 3) 若置信度不足且未超过3轮，则准备下一轮回到 flow_control
+            should_loop = refine_conf < 0.7 and (iteration + 1) < self.max_iterations and bool(needed)
+            next_iteration = iteration + 1 if should_loop else iteration
+
             result_state = {
                 **state,
-                'refined_signals': refined_signals,
-                'signal_validation': signal_validation,
-                'analysis_status': AnalysisStatus.COMPLETED
+                "refined_signals": refined_signals,
+                "signal_validation": signal_validation,
+                "refine_result": refine,
+                "refine_confidence": refine_conf,
+                "additional_signals": needed,
+                "analysis_status": AnalysisStatus.PROCESSING if should_loop else AnalysisStatus.COMPLETED,
+                "iteration": next_iteration,
+                # 下一轮让 flow_control 按同样规则处理这些信号（大小写不敏感）
+                "signals_to_process": needed if should_loop else (state.get("signals_to_process") or []),
             }
             mark_node_completed(result_state, "detailed_analysis", {
-                "validated": True,
-                "signal_count": signal_validation.get('signal_count'),
-                "average_quality": signal_validation.get('average_quality')
+                "validated": bool(signal_validation.get("validated")),
+                "refine_confidence": refine_conf,
+                "will_loop": should_loop,
+                "next_signal_count": len(needed) if should_loop else 0,
+                "iteration": next_iteration + 1,
             })
             return result_state
             
@@ -859,6 +1129,100 @@ class DetailedAnalysisNode:
             }
             mark_node_failed(failed_state, "detailed_analysis", str(e))
             return failed_state
+
+    async def _llm_refine(
+        self,
+        direction: str,
+        windows_list: List[Dict[str, Dict[str, str]]],
+        rule_meta: Dict[str, Any],
+        retrieval_by_query: Dict[str, List[Dict[str, Any]]],
+        validation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """LLM 细化分析：输出 conclusion/confidence/needed_signals。未配置时返回 mock。"""
+        # mock
+        if not self._llm_client or not self._model_name:
+            # 兜底：给一个中等偏低置信度，并建议再补一些信号
+            needed_signals = []
+            try:
+                # 从已规则化信号 windows 里推导（尽量不重复）
+                seen = set()
+                for item in windows_list[:5]:
+                    for k in item.keys():
+                        seen.add(str(k).lower())
+                # 建议再补充一些常见电气量信号
+                candidates = ["ChargeCurrent", "BatteryVoltage", "SOC", "BMS_State", "ConnectorState"]
+                for c in candidates:
+                    if c.lower() not in seen:
+                        needed_signals.append(c)
+            except Exception:
+                needed_signals = ["ChargeCurrent", "BatteryVoltage", "SOC"]
+            return {
+                "conclusion": "基于当前关键信号与知识库证据，尚无法高置信度定性，需要补充更多信号细节。",
+                "confidence": 0.55,
+                "needed_signals": needed_signals[:5],
+                "direction": direction or "general_analysis",
+            }
+
+        prompt = {
+            "direction": direction or "general_analysis",
+            "signal_windows": windows_list,
+            "signal_rule_meta": rule_meta,
+            "rag_evidence": retrieval_by_query,
+            "signal_validation": validation or {},
+            "requirements": {
+                "confidence_threshold": 0.7,
+                "max_iterations": self.max_iterations,
+                "output_json_schema": {
+                    "conclusion": "string",
+                    "confidence": "number(0~1)",
+                    "needed_signals": ["string", "..."],
+                },
+            },
+        }
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是充电系统诊断专家。"
+                    "输入包含关键信号的时间段值变化、枚举释义与知识库检索证据。"
+                    "请给出：1)当前阶段性结论(conclusion) 2)置信度(confidence 0~1) "
+                    "3)为了更好定性问题还需要哪些信号明细(needed_signals)。"
+                    "必须返回严格 JSON 对象，字段仅包含 conclusion/confidence/needed_signals。"
+                ),
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ]
+        try:
+            resp = await self._llm_client.chat.completions.create(
+                model=self._model_name,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1200,
+            )
+            content = resp.choices[0].message.content or ""
+            json_start = content.find("{")
+            json_end = content.rfind("}") + 1
+            if json_start != -1 and json_end > json_start:
+                payload = json.loads(content[json_start:json_end])
+            else:
+                payload = json.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("LLM 返回非 JSON 对象")
+            return {
+                "conclusion": str(payload.get("conclusion") or ""),
+                "confidence": float(payload.get("confidence") or 0.0),
+                "needed_signals": payload.get("needed_signals") or [],
+                "direction": direction or "general_analysis",
+            }
+        except Exception as exc:
+            logger.warning("细化分析 LLM 调用失败，将使用 mock: %s", exc)
+            return {
+                "conclusion": "LLM 细化分析失败，使用兜底策略。",
+                "confidence": 0.5,
+                "needed_signals": ["ChargeCurrent", "BatteryVoltage", "SOC"],
+                "direction": direction or "general_analysis",
+            }
     
     async def _extract_refined_signals(self, direction: str, context: str, df: pd.DataFrame) -> List[str]:
         """提取细化信号，基于实际数据列和问题方向"""
@@ -975,6 +1339,10 @@ class LLMAnalysisNode:
         data_stats = state.get('data_stats', {})
         refined_signals = state.get('refined_signals', [])
         validation = state.get('signal_validation', {})
+        refine_result = state.get("refine_result") or {}
+        signal_windows_list = state.get("signal_windows_list") or []
+        rule_meta = state.get("signal_rule_meta") or {}
+        retrieval_by_query = state.get("retrieval_by_query") or {}
         mark_node_started(state, "llm_analysis", "生成诊断结论")
         
         try:
@@ -984,7 +1352,15 @@ class LLMAnalysisNode:
             # 构建分析提示（安全处理可能为 None 的值）
             problem_direction = problem_direction or 'general_analysis'
             prompt = self._build_analysis_prompt(
-                problem_direction, context, data_stats or {}, refined_signals or [], validation or {}
+                problem_direction,
+                context,
+                data_stats or {},
+                refined_signals or [],
+                validation or {},
+                refine_result,
+                signal_windows_list,
+                rule_meta,
+                retrieval_by_query,
             )
             
             # 模拟LLM分析
@@ -1020,15 +1396,29 @@ class LLMAnalysisNode:
             mark_node_failed(failed_state, "llm_analysis", str(e))
             return failed_state
     
-    def _build_analysis_prompt(self, direction: str, context: str, stats: Dict, 
-                              signals: List[str], validation: Dict) -> str:
-        """构建分析提示，基于实际信号统计"""
+    def _build_analysis_prompt(
+        self,
+        direction: str,
+        context: str,
+        stats: Dict,
+        signals: List[str],
+        validation: Dict,
+        refine_result: Dict[str, Any],
+        signal_windows_list: List[Dict[str, Dict[str, str]]],
+        rule_meta: Dict[str, Any],
+        retrieval_by_query: Dict[str, List[Dict[str, Any]]],
+    ) -> str:
+        """构建最终分析提示：按你的三问输出最终结论。"""
         # 安全处理可能为 None 的参数
         direction = direction or 'general_analysis'
         context = context or ''
         stats = stats or {}
         signals = signals or []
         validation = validation or {}
+        refine_result = refine_result or {}
+        signal_windows_list = signal_windows_list or []
+        rule_meta = rule_meta or {}
+        retrieval_by_query = retrieval_by_query or {}
         
         signal_stats = stats.get('signal_stats', {}) if isinstance(stats, dict) else {}
         
@@ -1051,33 +1441,49 @@ class LLMAnalysisNode:
         
         signals_text = "\n".join(signal_descriptions) if signal_descriptions else "  - 无详细统计"
         
-        prompt = f"""
-基于以下充电数据分析，生成详细的诊断报告：
+        # 最终输出严格要求：补充三问结构
+        # 1) 是否 2015 标准桩（基于 CHM_ComVersion / 检索证据）
+        # 2) 流程问题：车/桩/阶段定位
+        # 3) 原因与建议
+        payload = {
+            "direction": direction,
+            "signal_windows": signal_windows_list,
+            "signal_rule_meta": rule_meta,
+            "rag_evidence": retrieval_by_query,
+            "refine_result": refine_result,
+            "data_stats": {
+                "total_records": stats.get("total_records", 0) if isinstance(stats, dict) else 0,
+                "signal_count": stats.get("signal_count", 0) if isinstance(stats, dict) else 0,
+                "time_range": stats.get("time_range", {}) if isinstance(stats, dict) else {},
+                "key_signal_stats": signal_descriptions[:10],
+            },
+            "validation": validation,
+            "fallback_context": context[:1500],
+            "requirements": {
+                "output_json_schema": {
+                    "is_gbt2015_pile": "boolean|null",
+                    "pile_protocol": "string",
+                    "process_assessment": {
+                        "has_process_issue": "boolean",
+                        "responsibility": "car|pile|unknown|both",
+                        "stage_breakdown": [{"stage": "string", "issue": "string", "evidence": ["string", "..."]}],
+                    },
+                    "root_causes": ["string", "..."],
+                    "recommendations": ["string", "..."],
+                    "summary": "string",
+                    "confidence": "number(0~1)",
+                }
+            },
+        }
 
-问题方向：{direction}
-相关信号：{', '.join(signals[:10])}{'...' if len(signals) > 10 else ''}
-        信号验证结果：{validation.get('average_quality', 0) if isinstance(validation, dict) else 0:.2f}
-
-数据统计：
-- 总记录数：{stats.get('total_records', 0) if isinstance(stats, dict) else 0}
-- 解析信号数：{stats.get('signal_count', 0) if isinstance(stats, dict) else 0}
-- 时间范围：{(stats.get('time_range') or {}).get('start', '') if isinstance(stats, dict) else ''} 至 {(stats.get('time_range') or {}).get('end', '') if isinstance(stats, dict) else ''}
-
-信号统计：
-{signals_text}
-
-相关知识：
-{context[:1000]}...
-
-请生成包含以下内容的诊断报告：
-1. 问题诊断总结
-2. 关键发现
-3. 风险评估
-4. 建议措施
-5. 技术细节
-
-以JSON格式返回结果。
-"""
+        prompt = (
+            "请基于输入的关键信号时间段变化、枚举释义与知识库证据，回答并只返回严格 JSON：\n"
+            "1) 是否是标准2015充电桩？\n"
+            "2) 整个充电流程有问题吗？是车的问题还是桩的问题？哪个阶段有什么问题？\n"
+            "3) 可能的原因及优化建议？\n"
+            "注意：若证据不足可返回 unknown/null，但要降低 confidence。\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
         return prompt
     
     async def _llm_analysis(self, prompt: str) -> Dict[str, Any]:
@@ -1251,7 +1657,17 @@ class ReportGenerationNode:
             confidence_score = flow_analysis.get('confidence', 0.0)
         
         return {
-            'html_content': f"<html><body><h1>充电分析报告</h1><p>{summary}</p></body></html>",
+            # 简化版 HTML：把三问的关键字段展示出来（前端如有独立渲染可忽略此 html_content）
+            'html_content': (
+                "<html><body>"
+                "<h1>充电分析报告</h1>"
+                f"<p>{summary}</p>"
+                f"<h2>2015国标桩判断</h2><pre>{json.dumps({'is_gbt2015_pile': analysis.get('is_gbt2015_pile'), 'pile_protocol': analysis.get('pile_protocol')}, ensure_ascii=False)}</pre>"
+                f"<h2>流程评估</h2><pre>{json.dumps(analysis.get('process_assessment') or {}, ensure_ascii=False)}</pre>"
+                f"<h2>可能原因</h2><pre>{json.dumps(analysis.get('root_causes') or [], ensure_ascii=False)}</pre>"
+                f"<h2>优化建议</h2><pre>{json.dumps(analysis.get('recommendations') or [], ensure_ascii=False)}</pre>"
+                "</body></html>"
+            ),
             'summary': summary,
             'detailed_analysis': analysis,
             'metadata': {
@@ -1267,16 +1683,25 @@ class ReportGenerationNode:
         validation = data.get('validation') or {}
         
         summary_parts = []
-        if analysis and isinstance(analysis, dict) and 'summary' in analysis:
-            summary_parts.append(f"诊断结论：{analysis['summary']}")
+        if analysis and isinstance(analysis, dict):
+            if 'summary' in analysis and analysis.get("summary"):
+                summary_parts.append(f"诊断结论：{analysis['summary']}")
+            if analysis.get("confidence") is not None:
+                try:
+                    summary_parts.append(f"置信度：{float(analysis.get('confidence')):.0%}")
+                except Exception:
+                    pass
+            if analysis.get("pile_protocol"):
+                summary_parts.append(f"协议/桩类型：{analysis.get('pile_protocol')}")
         
         if validation and isinstance(validation, dict) and validation.get('validated'):
             signal_count = validation.get('signal_count', 0)
             summary_parts.append(f"基于{signal_count}个高质量信号进行分析")
         
-        if analysis and isinstance(analysis, dict) and 'risk_assessment' in analysis:
-            risk = analysis['risk_assessment']
-            summary_parts.append(f"风险评估：{risk}")
+        if analysis and isinstance(analysis, dict) and analysis.get("process_assessment"):
+            pa = analysis.get("process_assessment") or {}
+            if isinstance(pa, dict) and "responsibility" in pa:
+                summary_parts.append(f"责任判定：{pa.get('responsibility')}")
         
         if not summary_parts:
             return "分析完成，未发现明显异常。"
@@ -1364,7 +1789,15 @@ class ChargingAnalysisWorkflow:
         self.graph.add_edge("message_parsing", "flow_control")
         self.graph.add_edge("flow_control", "rag_retrieval")
         self.graph.add_edge("rag_retrieval", "detailed_analysis")
-        self.graph.add_edge("detailed_analysis", "llm_analysis")
+        # 细化分析后根据置信度决定：回到 flow_control 继续补信号，或进入最终 LLM 分析
+        self.graph.add_conditional_edges(
+            "detailed_analysis",
+            self.should_continue_analysis,
+            {
+                "flow_control": "flow_control",
+                "llm_analysis": "llm_analysis",
+            },
+        )
         self.graph.add_edge("llm_analysis", "report_generation")
         self.graph.add_edge("report_generation", END)
     
@@ -1407,17 +1840,21 @@ class ChargingAnalysisWorkflow:
             }
     
     def should_continue_analysis(self, state: ChargingAnalysisState) -> str:
-        """决定是否继续分析"""
-        validation = state.get('signal_validation', {})
-        
-        # 如果验证通过，进行LLM分析
-        if validation.get('validated'):
+        """细化分析后决定：是否回到流程控制补信号。"""
+        iteration = int(state.get("iteration") or 0)
+        conf = float(state.get("refine_confidence") or 0.0)
+        additional = state.get("additional_signals") or []
+
+        # 达到阈值：进入最终 LLM 分析
+        if conf >= 0.7:
             return "llm_analysis"
-        
-        # 如果达到最大迭代次数，结束分析
-        iteration = state.get('iteration', 0)
+
+        # 超过最大轮次：也进入最终 LLM（但置信度低，结论需要提示不确定）
         if iteration >= 3:
-            return "end"
-        
-        # 否则继续下一轮分析
-        return "continue"
+            return "llm_analysis"
+
+        # 有可补充信号：回到流程控制继续
+        if additional:
+            return "flow_control"
+
+        return "llm_analysis"
