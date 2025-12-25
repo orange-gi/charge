@@ -776,9 +776,13 @@ class RagService:
             if strict_cached and isinstance(strict_cached.get("documents"), list):
                 results = strict_cached["documents"]
             else:
-                where = {"primary_tag_value": candidate_tag}
+                # Chroma where 语法：顶层只能是一个操作符。
+                # 需要同时约束 key + value 时，使用 $and。
+                where: dict[str, Any]
                 if candidate_key:
-                    where["primary_tag_key"] = candidate_key
+                    where = {"$and": [{"primary_tag_key": candidate_key}, {"primary_tag_value": candidate_tag}]}
+                else:
+                    where = {"primary_tag_value": candidate_tag}
                 strict_hits = self._vector.get_by_where(chroma_collection_id=chroma_id, where=where, limit=50)
                 results = self._format_hits(strict_hits, prefer_strict_score=True)[:limit]
                 # 负缓存：严格等值未命中也缓存短 TTL，避免击穿
