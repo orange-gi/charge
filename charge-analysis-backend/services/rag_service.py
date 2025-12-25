@@ -23,7 +23,7 @@ from config import get_settings
 from database import session_scope
 from models import KnowledgeCollection, KnowledgeDocument, RAGQuery, RagDocumentLog, LogLevel
 from services.rag_cache import HybridCache
-from services.rag_normalize import extract_candidate_primary_tag, normalize_primary_tag_value, normalize_text
+from services.rag_normalize import extract_candidate_primary_tag, extract_candidate_primary_tag_kv, normalize_primary_tag_value, normalize_text
 from services.rag_vector_store import ChromaVectorStore, VectorHit, embed_query, embed_texts_batched
 
 logger = logging.getLogger(__name__)
@@ -752,20 +752,34 @@ class RagService:
                 "query_time": elapsed_ms,
             }
 
-        # 1) 严格等值命中优先：尝试从 query 中提取主标签值
-        candidate_tag = extract_candidate_primary_tag(query)
+        # 1) 严格等值命中优先（避免跨表错配）：
+        #    - 若 query 形如 "停充码ChrgEndNum 8bit=10"，提取 (key,val)，并同时约束 primary_tag_key + primary_tag_value
+        #    - 若 query 仅为纯数字（例如用户直接输入 "10"），允许按 value-only 严格命中
+        normalized_query_for_kv = normalize_text(query)
+        candidate_kv = extract_candidate_primary_tag_kv(normalized_query_for_kv)
+        candidate_tag: str | None = None
+        candidate_key: str | None = None
+        if candidate_kv:
+            candidate_key, candidate_tag = candidate_kv[0], candidate_kv[1]
+        else:
+            # 仅纯数字场景才启用 value-only strict（否则容易误把任意 "=2" 命中成停充码2）
+            if normalized_query_for_kv.isdigit():
+                candidate_tag = normalize_primary_tag_value(normalized_query_for_kv)
         results: list[dict[str, Any]] = []
         if candidate_tag:
-            strict_cache_key = f"rag:strict:{collection_id}:r{revision}:{candidate_tag}"
+            strict_cache_key = (
+                f"rag:strict:{collection_id}:r{revision}:{candidate_key}={candidate_tag}"
+                if candidate_key
+                else f"rag:strict:{collection_id}:r{revision}:{candidate_tag}"
+            )
             strict_cached = self._cache.get_json(strict_cache_key)
             if strict_cached and isinstance(strict_cached.get("documents"), list):
                 results = strict_cached["documents"]
             else:
-                strict_hits = self._vector.get_by_where(
-                    chroma_collection_id=chroma_id,
-                    where={"primary_tag_value": candidate_tag},
-                    limit=50,
-                )
+                where = {"primary_tag_value": candidate_tag}
+                if candidate_key:
+                    where["primary_tag_key"] = candidate_key
+                strict_hits = self._vector.get_by_where(chroma_collection_id=chroma_id, where=where, limit=50)
                 results = self._format_hits(strict_hits, prefer_strict_score=True)[:limit]
                 # 负缓存：严格等值未命中也缓存短 TTL，避免击穿
                 self._cache.set_json(strict_cache_key, {"documents": results}, ttl_seconds=60 if not results else 3600)
