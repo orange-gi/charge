@@ -14,6 +14,7 @@ from datetime import datetime
 from enum import Enum
 import ipaddress
 from urllib.parse import urlparse
+import os
 
 import pandas as pd
 from langgraph.graph import StateGraph, START, END
@@ -113,13 +114,21 @@ def _iso_now() -> str:
 
 def _should_trust_env_proxies(base_url: str) -> bool:
     """内网 LLM 常见场景：应绕过 HTTP(S)_PROXY，避免代理导致 504/无法访问。"""
+    # 显式开关：需要走代理时可设置 OPENAI_TRUST_ENV=1/true
+    if str(os.environ.get("OPENAI_TRUST_ENV") or "").strip().lower() in {"1", "true", "yes", "y"}:
+        return True
     try:
         host = urlparse(base_url or "").hostname or ""
     except Exception:
         host = ""
     if not host:
+        # 没有 host 时保持默认：信任环境（不强行改变）
         return True
     host_l = host.lower()
+    # 华为内网域名（你这里的 api.openai.rnd.huawei.com）默认认为是“应直连”
+    # 说明：你报错页来自 HIS Proxy，意味着当前请求仍走了 SWG/代理；直连可避免 504。
+    if host_l.endswith(".huawei.com") or host_l.endswith(".huawei.com.cn"):
+        return False
     # 常见内网域名后缀
     if host_l.endswith(".internal") or host_l.endswith(".local") or host_l.endswith(".lan"):
         return False
@@ -132,6 +141,27 @@ def _should_trust_env_proxies(base_url: str) -> bool:
         pass
     # 兜底：保持默认（信任环境）
     return True
+
+
+def _ensure_no_proxy_for_base_url(base_url: str) -> None:
+    """把 base_url 的 host 加入 NO_PROXY/no_proxy（注意：不要使用 *.domain 这种通配符）。"""
+    try:
+        host = urlparse(base_url or "").hostname or ""
+    except Exception:
+        host = ""
+    if not host:
+        return
+    # 兼容不同库：NO_PROXY 与 no_proxy 都设置
+    cur = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    parts = [p.strip() for p in cur.split(",") if p.strip()]
+    # httpx/urllib3 通常支持 ".domain.com" 作为后缀匹配，但不保证支持 "*.domain.com"
+    suffix = "." + ".".join(host.split(".")[-2:]) if host.count(".") >= 1 else ""
+    for item in [host, suffix]:
+        if item and item not in parts:
+            parts.append(item)
+    merged = ",".join(parts)
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged
 
 
 def _ensure_trace_entry(state: ChargingAnalysisState, node_id: str) -> Dict[str, Any]:
@@ -1071,7 +1101,9 @@ class DetailedAnalysisNode:
         if getattr(settings, "openai_api_key", None) and getattr(settings, "openai_base_url", None):
             try:
                 from openai import AsyncOpenAI
-                trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
+                base_url = str(settings.openai_base_url)
+                _ensure_no_proxy_for_base_url(base_url)
+                trust_env = _should_trust_env_proxies(base_url)
                 # 不同 openai SDK 版本对 http_client 类型要求不同，这里优先使用 httpx.AsyncClient（兼容性最好）
                 http_client = None
                 try:
@@ -1389,7 +1421,9 @@ class LLMAnalysisNode:
         if settings.openai_api_key and settings.openai_base_url:
             try:
                 from openai import AsyncOpenAI
-                trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
+                base_url = str(settings.openai_base_url)
+                _ensure_no_proxy_for_base_url(base_url)
+                trust_env = _should_trust_env_proxies(base_url)
                 http_client = None
                 try:
                     import httpx  # type: ignore

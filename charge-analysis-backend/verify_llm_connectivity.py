@@ -180,8 +180,13 @@ def main() -> int:
     print("== Effective config ==")
     print("base_url=", base_url)
     print("model=", model)
+    # 这些环境变量也可能影响代理行为（尤其是小写/ALL_PROXY）
     _print_env("HTTP_PROXY")
     _print_env("HTTPS_PROXY")
+    _print_env("http_proxy")
+    _print_env("https_proxy")
+    _print_env("ALL_PROXY")
+    _print_env("all_proxy")
     _print_env("NO_PROXY")
     _print_env("no_proxy")
 
