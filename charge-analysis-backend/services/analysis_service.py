@@ -197,92 +197,148 @@ class AnalysisService:
         return _progress
 
     async def _persist_success_state(self, analysis_id: int, state: Dict[str, Any]) -> None:
+        """
+        持久化策略（避免“后半段写库失败导致前端看不到任何流程”）：
+        - Phase 1：先写 ChargingAnalysis.result_data（工作流全量状态），并更新 status/progress
+        - Phase 2：再写 AnalysisResult 明细（失败不应影响 Phase 1 的可视化展示）
+        """
         summary_payload = self._build_result_payload(state)
         llm_analysis = state.get("llm_analysis") or {}
-        recommendations = llm_analysis.get("recommendations") or []
-        findings = llm_analysis.get("findings") or []
 
+        workflow_status: WorkflowStatus = state.get("analysis_status", WorkflowStatus.COMPLETED)
+        mapped_status = self._map_workflow_status(workflow_status)
+
+        # --- Phase 1：先保存 result_data，保证前端能展示已完成节点与失败节点 ---
         with session_scope() as session:
             analysis: ChargingAnalysis | None = session.get(ChargingAnalysis, analysis_id)
             if analysis is None:
                 return
-
-            workflow_status: WorkflowStatus = state.get("analysis_status", WorkflowStatus.COMPLETED)
-            analysis.status = self._map_workflow_status(workflow_status)
+            analysis.status = mapped_status
             analysis.progress = 100.0 if analysis.status == AnalysisStatus.COMPLETED else analysis.progress
             analysis.completed_at = datetime.utcnow()
             # 保证写入数据库的是严格 JSON（禁止 NaN/Infinity）
             analysis.result_data = json.dumps(summary_payload, ensure_ascii=False, allow_nan=False)
+            session.add(analysis)
 
-            # 清理旧结果
-            session.query(AnalysisResult).filter(
-                AnalysisResult.analysis_id == analysis_id
-            ).delete(synchronize_session=False)
+        # --- Phase 2：写 AnalysisResult 明细（若失败，仅记录日志+写入 error_message，不影响流程展示） ---
+        def _textify(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict):
+                # 常见 finding 结构：{"finding": "...", "evidence": "..."}
+                if "finding" in v or "evidence" in v:
+                    parts = []
+                    if v.get("finding"):
+                        parts.append(str(v.get("finding")))
+                    if v.get("evidence"):
+                        parts.append(f"证据：{v.get('evidence')}")
+                    if parts:
+                        return "\n".join(parts)
+                return json.dumps(v, ensure_ascii=False)
+            if isinstance(v, (list, tuple)):
+                return json.dumps(v, ensure_ascii=False)
+            return str(v)
+
+        try:
+            recommendations = llm_analysis.get("recommendations") or []
+            findings = llm_analysis.get("findings") or []
 
             # 安全地获取最终报告摘要
             final_report = summary_payload.get("final_report") or {}
             summary_content = (
-                llm_analysis.get("summary") 
-                or (final_report.get("summary") if isinstance(final_report, dict) else "")
-                or state.get("error_message", "分析完成")
-            )
-            
-            # 安全地获取置信度分数
-            flow_analysis = summary_payload.get("flow_analysis") or {}
-            confidence_score = (
-                flow_analysis.get("confidence") 
-                if isinstance(flow_analysis, dict) 
-                else 0.0
+                _textify(llm_analysis.get("summary"))
+                or (_textify(final_report.get("summary")) if isinstance(final_report, dict) else "")
+                or _textify(state.get("error_message"))
+                or "分析完成"
             )
 
-            # 汇总结果
-            session.add(
-                AnalysisResult(
-                    analysis_id=analysis_id,
-                    result_type="summary",
-                    title="充电分析总结",
-                    content=summary_content,
-                    confidence_score=confidence_score,
-                    meta_info=json.dumps({"category": "overview", "risk": llm_analysis.get("risk_assessment")}, ensure_ascii=False),
-                )
-            )
+            # 置信度优先使用 LLM 输出的 confidence，其次回退 flow_analysis.confidence
+            confidence_score = 0.0
+            try:
+                llm_conf = llm_analysis.get("confidence")
+                if llm_conf is not None:
+                    confidence_score = float(llm_conf)
+            except Exception:
+                confidence_score = 0.0
+            if not confidence_score:
+                flow_analysis = summary_payload.get("flow_analysis") or {}
+                if isinstance(flow_analysis, dict):
+                    try:
+                        confidence_score = float(flow_analysis.get("confidence") or 0.0)
+                    except Exception:
+                        confidence_score = 0.0
 
-            for idx, finding in enumerate(findings, start=1):
+            with session_scope() as session:
+                # 清理旧结果
+                session.query(AnalysisResult).filter(
+                    AnalysisResult.analysis_id == analysis_id
+                ).delete(synchronize_session=False)
+
+                # 汇总结果
                 session.add(
                     AnalysisResult(
                         analysis_id=analysis_id,
-                        result_type="finding",
-                        title=f"关键发现{idx}",
-                        content=finding,
-                        confidence_score=0.85,
-                        meta_info=json.dumps({"category": "finding"}, ensure_ascii=False),
+                        result_type="summary",
+                        title="充电分析总结",
+                        content=summary_content,
+                        confidence_score=confidence_score,
+                        meta_info=json.dumps(
+                            {"category": "overview", "risk": llm_analysis.get("risk_assessment")},
+                            ensure_ascii=False,
+                        ),
                     )
                 )
 
-            for idx, rec in enumerate(recommendations, start=1):
-                session.add(
-                    AnalysisResult(
-                        analysis_id=analysis_id,
-                        result_type="recommendation",
-                        title=f"建议措施{idx}",
-                        content=rec,
-                        confidence_score=0.8,
-                        meta_info=json.dumps({"priority": "medium"}, ensure_ascii=False),
+                for idx, finding in enumerate(findings, start=1):
+                    session.add(
+                        AnalysisResult(
+                            analysis_id=analysis_id,
+                            result_type="finding",
+                            title=f"关键发现{idx}",
+                            content=_textify(finding),
+                            confidence_score=0.85,
+                            meta_info=json.dumps({"category": "finding"}, ensure_ascii=False),
+                        )
                     )
-                )
 
-            data_stats = summary_payload.get("data_stats")
-            if data_stats:
-                session.add(
-                    AnalysisResult(
-                        analysis_id=analysis_id,
-                        result_type="technical",
-                        title="技术数据详情",
-                        content=json.dumps(data_stats, ensure_ascii=False),
-                        confidence_score=0.9,
-                        meta_info=json.dumps({"category": "data"}, ensure_ascii=False),
+                for idx, rec in enumerate(recommendations, start=1):
+                    session.add(
+                        AnalysisResult(
+                            analysis_id=analysis_id,
+                            result_type="recommendation",
+                            title=f"建议措施{idx}",
+                            content=_textify(rec),
+                            confidence_score=0.8,
+                            meta_info=json.dumps({"priority": "medium"}, ensure_ascii=False),
+                        )
                     )
-                )
+
+                data_stats = summary_payload.get("data_stats")
+                if data_stats:
+                    session.add(
+                        AnalysisResult(
+                            analysis_id=analysis_id,
+                            result_type="technical",
+                            title="技术数据详情",
+                            content=json.dumps(data_stats, ensure_ascii=False),
+                            confidence_score=0.9,
+                            meta_info=json.dumps({"category": "data"}, ensure_ascii=False),
+                        )
+                    )
+        except Exception as exc:
+            logger.exception("写入 AnalysisResult 明细失败（不影响流程展示）analysis_id=%s err=%s", analysis_id, exc)
+            try:
+                with session_scope() as session:
+                    analysis: ChargingAnalysis | None = session.get(ChargingAnalysis, analysis_id)
+                    if analysis is not None:
+                        # 不改变最终状态，仅提示明细写入失败
+                        analysis.error_message = f"结果明细写入失败：{exc}"
+                        session.add(analysis)
+            except Exception:
+                # 不再向上抛，避免把分析整体标记为失败
+                return
 
     def _map_workflow_status(self, status: WorkflowStatus) -> AnalysisStatus:
         mapping = {
