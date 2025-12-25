@@ -1034,6 +1034,15 @@ const ChargingPage = () => {
           } else {
             message.error('分析失败：' + (analysis.errorMessage || '未知错误'));
           }
+          // 即使失败，也尽量加载 resultData，让前端能展示“已完成的节点”与“失败节点报错”
+          if (analysis.resultData) {
+            try {
+              const data = JSON.parse(analysis.resultData);
+              setAnalysisData(data);
+            } catch (e) {
+              console.error('解析失败时的分析数据失败:', e);
+            }
+          }
           // Refresh history
           loadAnalysisHistory();
         } else if (analysis.status === 'processing') {
