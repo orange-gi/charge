@@ -515,7 +515,7 @@ const ChargingPage = () => {
 
   // 后端“流程控制”特殊处理的 5 个关键信号（大小写不敏感）
   const KEY_SIGNALS = React.useMemo(
-    () => ["DCChrgSt", "BMS_ChrgEndNum", "BMS_FaultNum1", "VIU0_FaultNum1", "CHM_ComVersion"],
+    () => ["BMS_DCChrgSt", "BMS_ChrgEndNum", "BMS_FaultNum1", "VIU0_FaultNum1", "CHM_ComVersion"],
     []
   );
 
