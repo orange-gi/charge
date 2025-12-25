@@ -9,6 +9,7 @@ from typing import Optional
 _RE_INVISIBLE_SPACE = re.compile(r"[\u00A0\u2000-\u200B\u202F\u205F\u3000]")
 _RE_WHITESPACE_RUN = re.compile(r"\s+")
 _RE_NUMBER_TOKEN = re.compile(r"\d+")
+_RE_KV_NUMBER = re.compile(r"(?P<key>[^=]{1,80})=(?P<val>\d+)")
 
 
 def normalize_text(text: str) -> str:
@@ -76,4 +77,21 @@ def extract_candidate_primary_tag(query: str) -> Optional[str]:
     if not m:
         return None
     return normalize_primary_tag_value(m.group(0))
+
+
+def extract_candidate_primary_tag_kv(query: str) -> Optional[tuple[str, str]]:
+    """从 query 中提取“主标签键=数字值”。
+
+    用途：严格等值命中时同时约束 primary_tag_key + primary_tag_value，
+    避免出现“BMS_DCChrgSt=2 被误命中为 停充码ChrgEndNum 8bit=2”的跨表错配。
+    """
+    s = normalize_text(query)
+    m = _RE_KV_NUMBER.search(s)
+    if not m:
+        return None
+    key = normalize_text(m.group("key"))
+    val = normalize_primary_tag_value(m.group("val"))
+    if not key or not val:
+        return None
+    return key, val
 
