@@ -479,6 +479,40 @@ const ChargingPage = () => {
   const dbcFileInputRef = React.useRef<HTMLInputElement>(null);
   const workflowTrace = analysisData?.workflow_trace || {};
 
+  const toDisplayText = React.useCallback((value: any): string => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (Array.isArray(value)) {
+      return value.map((v) => toDisplayText(v)).filter(Boolean).join('\n');
+    }
+    if (typeof value === 'object') {
+      // 常见结构：finding / evidence
+      const v: any = value;
+      const parts: string[] = [];
+      if (v.signal) parts.push(`信号：${v.signal}`);
+      if (v.description) parts.push(`描述：${v.description}`);
+      if (v.finding) parts.push(String(v.finding));
+      if (v.evidence) parts.push(`证据：${v.evidence}`);
+      if (parts.length) return parts.join('\n');
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return String(value);
+      }
+    }
+    return String(value);
+  }, []);
+
+  const getRiskLevel = React.useCallback((risk: any): string => {
+    if (!risk) return '';
+    if (typeof risk === 'string') return risk;
+    if (typeof risk === 'object') {
+      return String(risk.risk_level || risk.level || risk.severity || '');
+    }
+    return String(risk);
+  }, []);
+
   // 后端“流程控制”特殊处理的 5 个关键信号（大小写不敏感）
   const KEY_SIGNALS = React.useMemo(
     () => ["DCChrgSt", "BMS_ChrgEndNum", "BMS_FaultNum1", "VIU0_FaultNum1", "CHM_ComVersion"],
@@ -2509,16 +2543,16 @@ const ChargingPage = () => {
                       {details.data.summary && (
                         <div style={{ marginBottom: '16px' }}>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>诊断总结：</Typography.Text>
-                          <Typography.Text>{details.data.summary}</Typography.Text>
+                          <Typography.Text>{toDisplayText(details.data.summary)}</Typography.Text>
                         </div>
                       )}
                       {details.data.findings && details.data.findings.length > 0 && (
                         <div style={{ marginBottom: '16px' }}>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>关键发现：</Typography.Text>
                           <ul style={{ paddingLeft: '20px' }}>
-                            {details.data.findings.map((finding: string, index: number) => (
+                            {details.data.findings.map((finding: any, index: number) => (
                               <li key={index} style={{ marginBottom: '4px' }}>
-                                <Typography.Text>{finding}</Typography.Text>
+                                <Typography.Text>{toDisplayText(finding)}</Typography.Text>
                               </li>
                             ))}
                           </ul>
@@ -2527,21 +2561,28 @@ const ChargingPage = () => {
                       {details.data.risk_assessment && (
                         <div style={{ marginBottom: '16px' }}>
                           <Typography.Text strong>风险评估：</Typography.Text>
+                          {(() => {
+                            const lvl = getRiskLevel(details.data.risk_assessment);
+                            const color =
+                              lvl === '高' ? '#ff4d4f' :
+                              lvl === '中等' ? '#faad14' : '#52c41a';
+                            return (
                           <Typography.Text style={{ 
-                            color: details.data.risk_assessment === '高' ? '#ff4d4f' : 
-                                   details.data.risk_assessment === '中等' ? '#faad14' : '#52c41a'
+                            color
                           }}>
-                            {details.data.risk_assessment}
+                            {toDisplayText(details.data.risk_assessment)}
                           </Typography.Text>
+                            );
+                          })()}
                         </div>
                       )}
                       {details.data.recommendations && details.data.recommendations.length > 0 && (
                         <div>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>建议措施：</Typography.Text>
                           <ul style={{ paddingLeft: '20px' }}>
-                            {details.data.recommendations.map((rec: string, index: number) => (
+                            {details.data.recommendations.map((rec: any, index: number) => (
                               <li key={index} style={{ marginBottom: '4px' }}>
-                                <Typography.Text>{rec}</Typography.Text>
+                                <Typography.Text>{toDisplayText(rec)}</Typography.Text>
                               </li>
                             ))}
                           </ul>
@@ -2579,7 +2620,7 @@ const ChargingPage = () => {
                         <div style={{ marginBottom: '24px', padding: '20px', background: '#f0f4f8', borderRadius: '8px', borderLeft: '4px solid #2c5aa0' }}>
                           <Typography.Title level={5} style={{ marginBottom: '12px', color: '#2c5aa0' }}>分析总结</Typography.Title>
                           <Typography.Text style={{ fontSize: '15px', lineHeight: '1.8', color: '#1a1a1a' }}>
-                            {llmData.summary}
+                            {toDisplayText(llmData.summary)}
                           </Typography.Text>
                         </div>
                       )}
@@ -2589,7 +2630,7 @@ const ChargingPage = () => {
                         <div style={{ marginBottom: '24px' }}>
                           <Typography.Title level={5} style={{ marginBottom: '12px' }}>关键发现</Typography.Title>
                           <div style={{ display: 'grid', gap: '12px' }}>
-                            {llmData.findings.map((finding: string, index: number) => (
+                            {llmData.findings.map((finding: any, index: number) => (
                               <div key={index} style={{
                                 padding: '12px 16px',
                                 background: 'white',
@@ -2598,7 +2639,7 @@ const ChargingPage = () => {
                                 borderLeft: '3px solid #52c41a'
                               }}>
                                 <Typography.Text style={{ fontSize: '14px', lineHeight: '1.6' }}>
-                                  {finding}
+                                  {toDisplayText(finding)}
                                 </Typography.Text>
                               </div>
                             ))}
@@ -2610,14 +2651,21 @@ const ChargingPage = () => {
                       {llmData.risk_assessment && (
                         <div style={{ marginBottom: '24px', padding: '16px', background: '#fff7e6', borderRadius: '8px', border: '1px solid #ffe58f' }}>
                           <Typography.Title level={5} style={{ marginBottom: '8px' }}>风险评估</Typography.Title>
+                          {(() => {
+                            const lvl = getRiskLevel(llmData.risk_assessment);
+                            const color =
+                              lvl === '高' ? '#ff4d4f' :
+                              lvl === '中等' ? '#faad14' : '#52c41a';
+                            return (
                           <Typography.Text style={{ 
                             fontSize: '16px', 
                             fontWeight: '500',
-                            color: llmData.risk_assessment === '高' ? '#ff4d4f' : 
-                                   llmData.risk_assessment === '中等' ? '#faad14' : '#52c41a'
+                            color
                           }}>
-                            {llmData.risk_assessment}
+                            {toDisplayText(llmData.risk_assessment)}
                           </Typography.Text>
+                            );
+                          })()}
                         </div>
                       )}
                       
@@ -2626,7 +2674,7 @@ const ChargingPage = () => {
                         <div style={{ marginBottom: '24px' }}>
                           <Typography.Title level={5} style={{ marginBottom: '12px' }}>建议措施</Typography.Title>
                           <div style={{ display: 'grid', gap: '10px' }}>
-                            {llmData.recommendations.map((rec: string, index: number) => (
+                            {llmData.recommendations.map((rec: any, index: number) => (
                               <div key={index} style={{
                                 padding: '12px 16px',
                                 background: '#f5f5f5',
@@ -2651,7 +2699,7 @@ const ChargingPage = () => {
                                   {index + 1}
                                 </span>
                                 <Typography.Text style={{ fontSize: '14px', lineHeight: '1.6', flex: 1 }}>
-                                  {rec}
+                                  {toDisplayText(rec)}
                                 </Typography.Text>
                               </div>
                             ))}
