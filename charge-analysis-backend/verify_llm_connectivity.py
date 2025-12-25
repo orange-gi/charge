@@ -127,12 +127,25 @@ def _test_sync(base_url: str, api_key: str, model: str, stream: bool) -> None:
 
 async def _test_async(base_url: str, api_key: str, model: str, trust_env: bool) -> None:
     from openai import AsyncOpenAI
-    from openai import DefaultHttpxClient
 
     print(f"\n== AsyncOpenAI test (trust_env={trust_env}) ==")
     t0 = time.time()
-    http_client = DefaultHttpxClient(timeout=180.0, trust_env=trust_env)
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=180.0, max_retries=0, http_client=http_client)
+    # 注意：不同 openai SDK 版本对 http_client 类型要求不同。
+    # 这里使用 httpx.AsyncClient（最兼容的写法）。
+    try:
+        import httpx  # type: ignore
+
+        http_client = httpx.AsyncClient(timeout=httpx.Timeout(180.0), trust_env=trust_env)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=180.0,
+            max_retries=0,
+            http_client=http_client,
+        )
+    except Exception:
+        # 兜底：不注入自定义 http_client，只测基本连通性
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=180.0, max_retries=0)
     try:
         resp = await client.chat.completions.create(
             model=model,
@@ -143,6 +156,12 @@ async def _test_async(base_url: str, api_key: str, model: str, trust_env: bool) 
         print(f"elapsed_ms={int((time.time() - t0) * 1000)}")
     except Exception as exc:
         print("ERROR(async):", repr(exc))
+    finally:
+        # 如果注入了 httpx.AsyncClient，记得关闭，避免资源泄露
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 def main() -> int:
