@@ -479,6 +479,65 @@ const ChargingPage = () => {
   const dbcFileInputRef = React.useRef<HTMLInputElement>(null);
   const workflowTrace = analysisData?.workflow_trace || {};
 
+  // 后端“流程控制”特殊处理的 5 个关键信号（大小写不敏感）
+  const KEY_SIGNALS = React.useMemo(
+    () => ["DCChrgSt", "BMS_ChrgEndNum", "BMS_FaultNum1", "VIU0_FaultNum1", "CHM_ComVersion"],
+    []
+  );
+
+  const pickDefaultSignals = React.useCallback(
+    (signals: any[]) => {
+      const norm = (s: any) => String(s ?? "").trim().toLowerCase();
+      const byLower = new Map<string, string>();
+      (signals || []).forEach((s: any) => {
+        if (s?.name) byLower.set(norm(s.name), String(s.name));
+      });
+
+      const selected: string[] = [];
+      const selectedLower = new Set<string>();
+
+      // 1) 优先选择后端特殊处理的 5 个信号（不区分大小写）
+      for (const k of KEY_SIGNALS) {
+        const hit = byLower.get(norm(k));
+        if (hit && !selectedLower.has(norm(hit))) {
+          selected.push(hit);
+          selectedLower.add(norm(hit));
+        }
+        if (selected.length >= 5) break;
+      }
+
+      // 2) 不足 5 个则补齐：优先常用信号，再用任意信号
+      const isCommon = (name: string) => {
+        const n = name.toLowerCase();
+        return (
+          n.includes("battery") ||
+          n.includes("charge") ||
+          n.includes("voltage") ||
+          n.includes("current") ||
+          n.includes("temp") ||
+          n.includes("soc")
+        );
+      };
+
+      const pool = [...(signals || [])]
+        .filter((s: any) => s?.name)
+        .sort((a: any, b: any) => Number(isCommon(String(b.name))) - Number(isCommon(String(a.name))));
+
+      for (const s of pool) {
+        if (selected.length >= 5) break;
+        const name = String(s.name);
+        const key = norm(name);
+        if (!selectedLower.has(key)) {
+          selected.push(name);
+          selectedLower.add(key);
+        }
+      }
+
+      return selected.slice(0, 5);
+    },
+    [KEY_SIGNALS]
+  );
+
   const loadDbcInfo = React.useCallback(async () => {
     if (!token) return;
     setLoadingDbcInfo(true);
@@ -553,6 +612,11 @@ const ChargingPage = () => {
       <div style={{ marginBottom: '16px', padding: '12px', background: '#fafafa', borderRadius: '6px', border: '1px solid #f0f0f0' }}>
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '12px' }}>
           <Tag color={status.color} style={{ marginRight: 0 }}>{status.label}</Tag>
+          {Array.isArray(trace.runs) && trace.runs.length > 1 && (
+            <Tag color="#2c5aa0" style={{ marginRight: 0 }}>
+              执行次数：{trace.runs.length}
+            </Tag>
+          )}
           {trace.started_at && (
             <Typography.Text type="secondary">
               开始：{formatDateTime(trace.started_at)}
@@ -568,6 +632,31 @@ const ChargingPage = () => {
           <Typography.Text style={{ display: 'block', marginTop: '8px', color: '#595959' }}>
             {trace.description}
           </Typography.Text>
+        )}
+        {Array.isArray(trace.runs) && trace.runs.length > 1 && (
+          <div style={{ marginTop: '10px' }}>
+            <Typography.Text type="secondary" style={{ display: 'block', marginBottom: '6px' }}>
+              历次执行：
+            </Typography.Text>
+            <div style={{ display: 'grid', gap: '6px' }}>
+              {trace.runs.map((r: any, idx: number) => (
+                <div key={idx} style={{ padding: '8px 10px', background: '#fff', border: '1px solid #f0f0f0', borderRadius: '6px' }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
+                    <Tag color={r.status === 'completed' ? '#52c41a' : r.status === 'failed' ? '#ff4d4f' : '#2c5aa0'} style={{ marginRight: 0 }}>
+                      {r.status || 'unknown'}
+                    </Tag>
+                    {r.started_at && <Typography.Text type="secondary">开始：{formatDateTime(r.started_at)}</Typography.Text>}
+                    {r.ended_at && <Typography.Text type="secondary">结束：{formatDateTime(r.ended_at)}</Typography.Text>}
+                  </div>
+                  {r.description && (
+                    <Typography.Text style={{ display: 'block', marginTop: '6px', color: '#595959' }}>
+                      {r.description}
+                    </Typography.Text>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
         )}
       </div>
     );
@@ -714,7 +803,13 @@ const ChargingPage = () => {
       flow_control: {
         title: '流程控制',
         data: {
-          ...(analysisData.flow_analysis || {}),
+          flowAnalysis: analysisData.flow_analysis || {},
+          problemDirection: analysisData.problem_direction,
+          confidenceScore: analysisData.confidence_score,
+          signalWindowsList: analysisData.signal_windows_list || [],
+          signalRuleMeta: analysisData.signal_rule_meta || {},
+          ragQueries: analysisData.rag_queries || [],
+          processedSignals: analysisData.processed_signals || [],
           trace: workflowTrace?.flow_control
         }
       },
@@ -723,6 +818,7 @@ const ChargingPage = () => {
         data: {
           retrievedDocuments: analysisData.retrieved_documents || [],
           retrievalContext: analysisData.retrieval_context || '',
+          retrievalByQuery: analysisData.retrieval_by_query || {},
           trace: workflowTrace?.rag_retrieval
         }
       },
@@ -731,6 +827,9 @@ const ChargingPage = () => {
         data: {
           refinedSignals: analysisData.refined_signals || [],
           signalValidation: analysisData.signal_validation || {},
+          refineResult: analysisData.refine_result || {},
+          refineConfidence: analysisData.refine_confidence,
+          additionalSignals: analysisData.additional_signals || [],
           trace: workflowTrace?.detailed_analysis
         }
       },
@@ -819,6 +918,11 @@ const ChargingPage = () => {
       const { chargingService } = await import('./services/chargingService');
       const response = await chargingService.getAvailableSignals(token);
       setAvailableSignals(response.signals);
+      // 默认勾选：优先“流程控制特殊处理的5个信号”，不足则补齐5个
+      const defaults = pickDefaultSignals(response.signals || []);
+      if (status === 'uploaded') {
+        setSelectedSignals(defaults);
+      }
     } catch (error: any) {
       console.error('加载信号列表失败:', error);
       message.warning('加载信号列表失败，将使用默认信号');
@@ -2144,20 +2248,104 @@ const ChargingPage = () => {
                   return (
                     <div>
                       {renderTraceInfo(details.data.trace)}
-                      <div style={{ marginBottom: '16px' }}>
-                        <Typography.Text strong>问题方向：</Typography.Text>
-                        <Typography.Text>{details.data.problem_direction || '未确定'}</Typography.Text>
-                      </div>
-                      <div style={{ marginBottom: '16px' }}>
-                        <Typography.Text strong>置信度：</Typography.Text>
-                        <Typography.Text>{(details.data.confidence || 0) * 100}%</Typography.Text>
-                      </div>
-                      {details.data.reasoning && (
-                        <div>
-                          <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>分析推理：</Typography.Text>
-                          <Typography.Text>{details.data.reasoning}</Typography.Text>
-                        </div>
-                      )}
+                      {(() => {
+                        const flowAnalysis = details.data.flowAnalysis || {};
+                        const signalWindowsList = details.data.signalWindowsList || [];
+                        const ragQueries = details.data.ragQueries || [];
+                        const signalRuleMeta = details.data.signalRuleMeta || {};
+                        const processedSignals = details.data.processedSignals || [];
+
+                        return (
+                          <div>
+                            <div style={{ display: 'grid', gap: '10px', marginBottom: '12px' }}>
+                              <div>
+                                <Typography.Text strong>问题方向：</Typography.Text>
+                                <Typography.Text>{details.data.problemDirection || '未确定'}</Typography.Text>
+                              </div>
+                              <div>
+                                <Typography.Text strong>当前置信度：</Typography.Text>
+                                <Typography.Text>
+                                  {typeof details.data.confidenceScore === 'number'
+                                    ? `${(details.data.confidenceScore * 100).toFixed(1)}%`
+                                    : '未知'}
+                                </Typography.Text>
+                              </div>
+                              <div>
+                                <Typography.Text strong>已规则化信号：</Typography.Text>
+                                <Typography.Text>
+                                  {Array.isArray(flowAnalysis.handled_signals)
+                                    ? flowAnalysis.handled_signals.length
+                                    : (flowAnalysis.handled_signal_count ?? signalWindowsList.length ?? 0)}
+                                </Typography.Text>
+                              </div>
+                              <div>
+                                <Typography.Text strong>RAG 查询数：</Typography.Text>
+                                <Typography.Text>{ragQueries.length}</Typography.Text>
+                              </div>
+                            </div>
+
+                            <Tabs
+                              defaultActiveKey="signals"
+                              items={[
+                                {
+                                  key: 'signals',
+                                  label: signalWindowsList.length ? `规则化信号（${signalWindowsList.length}）` : '规则化信号',
+                                  children: (
+                                    <pre style={{ background: '#f5f5f5', padding: '12px', borderRadius: '6px', overflow: 'auto', maxHeight: '420px' }}>
+                                      {JSON.stringify(signalWindowsList, null, 2)}
+                                    </pre>
+                                  )
+                                },
+                                {
+                                  key: 'queries',
+                                  label: ragQueries.length ? `RAG查询（${ragQueries.length}）` : 'RAG查询',
+                                  children: ragQueries.length ? (
+                                    <Table
+                                      size="small"
+                                      rowKey={(r: any, i: number) => `${r.query || ''}-${i}`}
+                                      pagination={{ pageSize: 8, showSizeChanger: true, pageSizeOptions: ['8', '20', '50'] }}
+                                      columns={[
+                                        { title: '信号', dataIndex: 'signal', key: 'signal', width: 180 },
+                                        { title: '值', dataIndex: 'value', key: 'value', width: 80 },
+                                        { title: '查询', dataIndex: 'query', key: 'query' },
+                                        { title: '时间段数', key: 'intervals', width: 90, render: (_: any, r: any) => (r.intervals?.length ?? 0) }
+                                      ]}
+                                      dataSource={ragQueries}
+                                      scroll={{ x: 'max-content', y: 360 }}
+                                    />
+                                  ) : (
+                                    <div style={{ textAlign: 'center', padding: '24px', color: '#8c8c8c' }}>
+                                      未生成 RAG 查询（可能关键5信号在数据中未解析到）
+                                    </div>
+                                  )
+                                },
+                                {
+                                  key: 'meta',
+                                  label: '枚举/规则释义',
+                                  children: (
+                                    <pre style={{ background: '#f5f5f5', padding: '12px', borderRadius: '6px', overflow: 'auto', maxHeight: '420px' }}>
+                                      {JSON.stringify(signalRuleMeta, null, 2)}
+                                    </pre>
+                                  )
+                                },
+                                {
+                                  key: 'processed',
+                                  label: processedSignals.length ? `已处理（${processedSignals.length}）` : '已处理',
+                                  children: (
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                                      {processedSignals.map((s: string) => (
+                                        <span key={s} style={{ padding: '4px 10px', background: '#f0f5ff', borderRadius: '4px', fontSize: '13px' }}>
+                                          {s}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )
+                                }
+                              ]}
+                            />
+                          </div>
+                        );
+                      })()}
                     </div>
                   );
                 
@@ -2169,6 +2357,28 @@ const ChargingPage = () => {
                         <Typography.Text strong>检索到文档数：</Typography.Text>
                         <Typography.Text>{details.data.retrievedDocuments?.length || 0}</Typography.Text>
                       </div>
+                      {(() => {
+                        const retrievalByQuery = details.data.retrievalByQuery || {};
+                        const queryEntries = Object.entries(retrievalByQuery);
+                        if (!queryEntries.length) return null;
+                        return (
+                          <div style={{ marginBottom: '16px' }}>
+                            <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>
+                              按查询分组（已过滤相似度≥70%）：
+                            </Typography.Text>
+                            <div style={{ display: 'grid', gap: '8px' }}>
+                              {queryEntries.map(([q, docs]: any) => (
+                                <div key={q} style={{ padding: '10px 12px', background: '#f5f5f5', borderRadius: '6px' }}>
+                                  <Typography.Text strong>{q}</Typography.Text>
+                                  <Typography.Text type="secondary" style={{ marginLeft: '10px' }}>
+                                    命中：{Array.isArray(docs) ? docs.length : 0}
+                                  </Typography.Text>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })()}
                       {details.data.retrievedDocuments && details.data.retrievedDocuments.length > 0 && (
                         <div>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '12px' }}>相关文档：</Typography.Text>
@@ -2181,12 +2391,17 @@ const ChargingPage = () => {
                             }}>
                               <div style={{ marginBottom: '8px' }}>
                                 <Typography.Text strong>来源：</Typography.Text>
-                                <Typography.Text>{doc.metadata?.source || '未知'}</Typography.Text>
+                                <Typography.Text>
+                                  {doc.filename || doc.metadata?.source_filename || doc.metadata?.source || '未知'}
+                                  {doc.row_index != null && (
+                                    <Typography.Text type="secondary">（第{doc.row_index}行）</Typography.Text>
+                                  )}
+                                </Typography.Text>
                                 <Typography.Text type="secondary" style={{ marginLeft: '12px' }}>
-                                  相似度：{(doc.score * 100).toFixed(1)}%
+                                  相似度：{((doc.score || 0) * 100).toFixed(1)}%
                                 </Typography.Text>
                               </div>
-                              <Typography.Text>{doc.content}</Typography.Text>
+                              <Typography.Text>{doc.snippet || doc.content}</Typography.Text>
                             </div>
                           ))}
                         </div>
@@ -2202,6 +2417,41 @@ const ChargingPage = () => {
                         <Typography.Text strong>细化信号数：</Typography.Text>
                         <Typography.Text>{details.data.refinedSignals?.length || 0}</Typography.Text>
                       </div>
+                      {(() => {
+                        const refineResult = details.data.refineResult || {};
+                        const refineConfidence = details.data.refineConfidence;
+                        const additionalSignals = details.data.additionalSignals || [];
+                        return (
+                          <div>
+                            <div style={{ marginBottom: '16px', padding: '12px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: '6px' }}>
+                              <div style={{ marginBottom: '6px' }}>
+                                <Typography.Text strong>细化结论：</Typography.Text>
+                                <Typography.Text>{refineResult.conclusion || '暂无'}</Typography.Text>
+                              </div>
+                              <div>
+                                <Typography.Text strong>细化置信度：</Typography.Text>
+                                <Typography.Text>
+                                  {typeof refineConfidence === 'number' ? `${(refineConfidence * 100).toFixed(1)}%` : '未知'}
+                                </Typography.Text>
+                              </div>
+                            </div>
+                            {additionalSignals.length > 0 && (
+                              <div style={{ marginBottom: '16px' }}>
+                                <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>
+                                  建议补充的信号（用于下一轮流程控制）：
+                                </Typography.Text>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                                  {additionalSignals.map((signal: string) => (
+                                    <span key={signal} style={{ padding: '4px 12px', background: '#fff1f0', border: '1px solid #ffa39e', borderRadius: '4px', fontSize: '13px' }}>
+                                      {signal}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
                       {details.data.refinedSignals && details.data.refinedSignals.length > 0 && (
                         <div style={{ marginBottom: '16px' }}>
                           <Typography.Text strong style={{ display: 'block', marginBottom: '8px' }}>细化信号列表：</Typography.Text>
@@ -2507,6 +2757,15 @@ const ChargingPage = () => {
             style={{ marginTop: '24px', width: '100%' }}
           extra={
             <Space>
+              <Button
+                size="small"
+                onClick={() => {
+                  const defaults = pickDefaultSignals(availableSignals);
+                  setSelectedSignals(defaults);
+                }}
+              >
+                快速选择（关键5信号）
+              </Button>
               <Button 
                 size="small" 
                 onClick={() => {
