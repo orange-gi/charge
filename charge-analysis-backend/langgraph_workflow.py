@@ -658,12 +658,16 @@ class FlowControlModelNode:
     """流程控制模型节点"""
 
     _KEY_SIGNALS = [
-        "DCChrgSt",
+        "BMS_DCChrgSt",
         "BMS_ChrgEndNum",
         "BMS_FaultNum1",
         "VIU0_FaultNum1",
         "CHM_ComVersion",
     ]
+
+    # 流程控制阶段认为“无效/占位”的值：解析出来后直接过滤，不报错
+    # 备注：用户侧提到 15777215；此前也出现过 16777215（常见 0xFFFFFF）
+    _INVALID_VALUES = {"0", "16777215", "15777215"}
 
     _DCCHRGST_ENUM = {
         0x0: "Off 未插枪",
@@ -792,6 +796,11 @@ class FlowControlModelNode:
         end_s = self._format_hms(last_ts)
         if start_s and end_s:
             windows[f"{start_s}-{end_s}"] = last_val
+        # 过滤无效值（能解析多少算多少）
+        try:
+            windows = {k: v for k, v in windows.items() if str(v) not in self._INVALID_VALUES}
+        except Exception:
+            pass
         return windows
 
     def _build_rag_query(self, signal: str, value: str) -> str:
@@ -848,6 +857,8 @@ class FlowControlModelNode:
                 # 枚举释义（可选，用于 LLM/前端展示）
                 if sig_norm == "dcchrgst":
                     rule_meta[col] = {"enum": {str(k): v for k, v in self._DCCHRGST_ENUM.items()}}
+                elif sig_norm == "bms_dcchrgst":
+                    rule_meta[col] = {"enum": {str(k): v for k, v in self._DCCHRGST_ENUM.items()}}
                 elif sig_norm == "chm_comversion":
                     rule_meta[col] = {"enum": {str(k): v for k, v in self._CHM_COMVERSION_ENUM.items()}, "default": "未知充电桩"}
 
@@ -859,6 +870,9 @@ class FlowControlModelNode:
                 # 只针对本轮新增/关键处理的信号做查询：这里选择对所有已处理信号都可查询，但做去重
                 value_to_intervals: Dict[str, List[str]] = {}
                 for interval, val in (windows or {}).items():
+                    # 再次过滤无效值，避免后续误查询
+                    if str(val) in self._INVALID_VALUES:
+                        continue
                     value_to_intervals.setdefault(str(val), []).append(str(interval))
                 for val, intervals in value_to_intervals.items():
                     q = self._build_rag_query(sig_name, val)
