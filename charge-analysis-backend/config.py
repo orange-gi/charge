@@ -147,7 +147,8 @@ class Settings(BaseSettings):
     log_file: Optional[Path] = Field(default=None, env="LOG_FILE")
     
     model_config = {
-        "env_file": ".env",
+        # 使用 config.py 所在目录的 .env，避免工作目录不同导致“不生效”
+        "env_file": str(Path(__file__).resolve().parent / ".env"),
         "env_file_encoding": "utf-8",
         "extra": "ignore",  # 忽略额外的字段
     }
