@@ -1242,13 +1242,23 @@ class DetailedAnalysisNode:
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ]
         try:
-            resp = await self._llm_client.chat.completions.create(
+            # 使用 stream，避免网关长连接读超时（504）
+            stream = await self._llm_client.chat.completions.create(
                 model=self._model_name,
                 messages=messages,
                 temperature=0.2,
                 max_tokens=1200,
+                stream=True,
             )
-            content = resp.choices[0].message.content or ""
+            chunks: list[str] = []
+            async for event in stream:
+                try:
+                    delta = event.choices[0].delta
+                    if delta and delta.content:
+                        chunks.append(delta.content)
+                except Exception:
+                    continue
+            content = "".join(chunks) or ""
             json_start = content.find("{")
             json_end = content.rfind("}") + 1
             if json_start != -1 and json_end > json_start:
@@ -1590,16 +1600,25 @@ class LLMAnalysisNode:
                     }
                 ]
                 
-                # 调用 OpenAI 格式的 API
-                response = await self.llm_client.chat.completions.create(
+                # 使用 stream，避免网关长连接读超时（504）
+                stream = await self.llm_client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=2000
+                    max_tokens=2000,
+                    stream=True,
                 )
-                
-                # 提取响应内容
-                content = response.choices[0].message.content
+
+                chunks: list[str] = []
+                async for event in stream:
+                    try:
+                        delta = event.choices[0].delta
+                        if delta and delta.content:
+                            chunks.append(delta.content)
+                    except Exception:
+                        continue
+
+                content = "".join(chunks)
                 logger.debug(f"LLM 响应: {content[:200]}...")
                 
                 # 尝试解析 JSON 响应
