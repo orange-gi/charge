@@ -1070,16 +1070,31 @@ class DetailedAnalysisNode:
         self._llm_client = None
         if getattr(settings, "openai_api_key", None) and getattr(settings, "openai_base_url", None):
             try:
-                from openai import AsyncOpenAI, DefaultHttpxClient
+                from openai import AsyncOpenAI
                 trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
-                http_client = DefaultHttpxClient(timeout=180.0, trust_env=trust_env)
-                self._llm_client = AsyncOpenAI(
-                    api_key=settings.openai_api_key,
-                    base_url=settings.openai_base_url,
-                    timeout=180.0,
-                    max_retries=0,
-                    http_client=http_client,
-                )
+                # 不同 openai SDK 版本对 http_client 类型要求不同，这里优先使用 httpx.AsyncClient（兼容性最好）
+                http_client = None
+                try:
+                    import httpx  # type: ignore
+                    http_client = httpx.AsyncClient(timeout=httpx.Timeout(180.0), trust_env=trust_env)
+                except Exception:
+                    http_client = None
+
+                if http_client is not None:
+                    self._llm_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        base_url=settings.openai_base_url,
+                        timeout=180.0,
+                        max_retries=0,
+                        http_client=http_client,
+                    )
+                else:
+                    self._llm_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        base_url=settings.openai_base_url,
+                        timeout=180.0,
+                        max_retries=0,
+                    )
             except Exception:
                 self._llm_client = None
     
@@ -1363,16 +1378,30 @@ class LLMAnalysisNode:
         # 如果配置了 API Key 和 Base URL，则初始化 OpenAI 客户端
         if settings.openai_api_key and settings.openai_base_url:
             try:
-                from openai import AsyncOpenAI, DefaultHttpxClient
+                from openai import AsyncOpenAI
                 trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
-                http_client = DefaultHttpxClient(timeout=240.0, trust_env=trust_env)
-                self.llm_client = AsyncOpenAI(
-                    api_key=settings.openai_api_key,
-                    base_url=settings.openai_base_url,
-                    timeout=240.0,
-                    max_retries=0,
-                    http_client=http_client,
-                )
+                http_client = None
+                try:
+                    import httpx  # type: ignore
+                    http_client = httpx.AsyncClient(timeout=httpx.Timeout(240.0), trust_env=trust_env)
+                except Exception:
+                    http_client = None
+
+                if http_client is not None:
+                    self.llm_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        base_url=settings.openai_base_url,
+                        timeout=240.0,
+                        max_retries=0,
+                        http_client=http_client,
+                    )
+                else:
+                    self.llm_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        base_url=settings.openai_base_url,
+                        timeout=240.0,
+                        max_retries=0,
+                    )
                 self.model_name = settings.llm_model_name
                 logger.info(f"LLM 客户端已初始化: model={self.model_name}, base_url={settings.openai_base_url}")
             except ImportError:
