@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, TypedDict
 from datetime import datetime
 from enum import Enum
+import ipaddress
+from urllib.parse import urlparse
 
 import pandas as pd
 from langgraph.graph import StateGraph, START, END
@@ -107,6 +109,29 @@ class ChargingAnalysisState(TypedDict):
 
 def _iso_now() -> str:
     return datetime.utcnow().isoformat()
+
+
+def _should_trust_env_proxies(base_url: str) -> bool:
+    """内网 LLM 常见场景：应绕过 HTTP(S)_PROXY，避免代理导致 504/无法访问。"""
+    try:
+        host = urlparse(base_url or "").hostname or ""
+    except Exception:
+        host = ""
+    if not host:
+        return True
+    host_l = host.lower()
+    # 常见内网域名后缀
+    if host_l.endswith(".internal") or host_l.endswith(".local") or host_l.endswith(".lan"):
+        return False
+    # 直连 IP：若是私网/回环/链路本地，则不信任环境代理
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+    except Exception:
+        pass
+    # 兜底：保持默认（信任环境）
+    return True
 
 
 def _ensure_trace_entry(state: ChargingAnalysisState, node_id: str) -> Dict[str, Any]:
@@ -1045,8 +1070,16 @@ class DetailedAnalysisNode:
         self._llm_client = None
         if getattr(settings, "openai_api_key", None) and getattr(settings, "openai_base_url", None):
             try:
-                from openai import AsyncOpenAI
-                self._llm_client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+                from openai import AsyncOpenAI, DefaultHttpxClient
+                trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
+                http_client = DefaultHttpxClient(timeout=180.0, trust_env=trust_env)
+                self._llm_client = AsyncOpenAI(
+                    api_key=settings.openai_api_key,
+                    base_url=settings.openai_base_url,
+                    timeout=180.0,
+                    max_retries=0,
+                    http_client=http_client,
+                )
             except Exception:
                 self._llm_client = None
     
@@ -1216,7 +1249,25 @@ class DetailedAnalysisNode:
                 "direction": direction or "general_analysis",
             }
         except Exception as exc:
-            logger.warning("细化分析 LLM 调用失败，将使用 mock: %s", exc)
+            # 尽可能打印 HTTP 状态/响应体片段，便于定位 504 来自哪层网关
+            try:
+                from openai import APIStatusError
+                if isinstance(exc, APIStatusError):
+                    body = ""
+                    try:
+                        body = (exc.response.text or "")[:800]
+                    except Exception:
+                        body = ""
+                    logger.warning(
+                        "细化分析 LLM APIStatusError status=%s body=%s",
+                        getattr(exc, "status_code", None),
+                        body,
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning("细化分析 LLM 调用失败，将使用 mock: %s", exc, exc_info=True)
+            except Exception:
+                logger.warning("细化分析 LLM 调用失败，将使用 mock: %s", exc, exc_info=True)
             return {
                 "conclusion": "LLM 细化分析失败，使用兜底策略。",
                 "confidence": 0.5,
@@ -1312,10 +1363,15 @@ class LLMAnalysisNode:
         # 如果配置了 API Key 和 Base URL，则初始化 OpenAI 客户端
         if settings.openai_api_key and settings.openai_base_url:
             try:
-                from openai import AsyncOpenAI
+                from openai import AsyncOpenAI, DefaultHttpxClient
+                trust_env = _should_trust_env_proxies(str(settings.openai_base_url))
+                http_client = DefaultHttpxClient(timeout=240.0, trust_env=trust_env)
                 self.llm_client = AsyncOpenAI(
                     api_key=settings.openai_api_key,
-                    base_url=settings.openai_base_url
+                    base_url=settings.openai_base_url,
+                    timeout=240.0,
+                    max_retries=0,
+                    http_client=http_client,
                 )
                 self.model_name = settings.llm_model_name
                 logger.info(f"LLM 客户端已初始化: model={self.model_name}, base_url={settings.openai_base_url}")
@@ -1558,7 +1614,25 @@ class LLMAnalysisNode:
                     }
                     
             except Exception as e:
-                logger.error(f"调用 LLM API 失败: {e}，回退到模拟分析")
+                # 尽可能打印 HTTP 状态/响应体片段，便于定位 504 来自哪层网关
+                try:
+                    from openai import APIStatusError
+                    if isinstance(e, APIStatusError):
+                        body = ""
+                        try:
+                            body = (e.response.text or "")[:800]
+                        except Exception:
+                            body = ""
+                        logger.error(
+                            "调用 LLM API 失败 APIStatusError status=%s body=%s",
+                            getattr(e, "status_code", None),
+                            body,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.error(f"调用 LLM API 失败: {e}，回退到模拟分析", exc_info=True)
+                except Exception:
+                    logger.error(f"调用 LLM API 失败: {e}，回退到模拟分析", exc_info=True)
                 # 发生错误时回退到模拟分析
                 return await self._mock_llm_analysis()
         else:
