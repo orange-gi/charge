@@ -811,12 +811,57 @@ class FlowControlModelNode:
         # 其余信号先用通用格式
         return f"{signal}={value}"
 
+    def _build_rag_transition_query(self, signal: str, from_value: str, to_value: str) -> list[str]:
+        """构建“信号变化规则”检索 query（如 1->2）。返回多个模板以提高命中率。"""
+        s = str(signal)
+        a = str(from_value)
+        b = str(to_value)
+        # 多模板：中文描述 / 箭头 / 等号组合
+        return [
+            f"{s} 从 {a} 变到 {b}",
+            f"{s} {a}->{b}",
+            f"{s} {a}→{b}",
+            f"{s} 变化 {a} 到 {b}",
+        ]
+
+    def _extract_transitions(self, windows: Dict[str, str]) -> List[Dict[str, str]]:
+        """从时间段->值中提取相邻变化（保持插入顺序）。"""
+        items = list((windows or {}).items())
+        transitions: List[Dict[str, str]] = []
+        if len(items) < 2:
+            return transitions
+        last_interval, last_val = items[0]
+        for cur_interval, cur_val in items[1:]:
+            if str(cur_val) != str(last_val):
+                # 边界时间：取上一段的 end（HH:MM:SS-HH:MM:SS）
+                boundary = ""
+                try:
+                    boundary = str(last_interval).split("-", 1)[-1]
+                except Exception:
+                    boundary = ""
+                transitions.append(
+                    {
+                        "from": str(last_val),
+                        "to": str(cur_val),
+                        "boundary_time": boundary,
+                        "from_interval": str(last_interval),
+                        "to_interval": str(cur_interval),
+                    }
+                )
+            last_interval, last_val = cur_interval, cur_val
+        return transitions
+
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
-        """处理流程控制：关键信号规则化 + 构建 RAG 查询。"""
+        """ReAct-工具一：信号获取阶段（从原始解析数据中提取指定信号，并按时间段规则化）。"""
         df = state.get('parsed_data')
         stats = state.get('data_stats')
         iteration = int(state.get("iteration") or 0)
-        mark_node_started(state, "flow_control", f"流程控制规则处理（第{iteration + 1}轮）", {"iteration": iteration})
+        mark_node_started(
+            state,
+            "flow_control",
+            f"ReAct-信号获取（第{iteration + 1}轮）",
+            {"iteration": iteration, "phase": "act_signal_acquisition"},
+        )
         
         if df is None or stats is None:
             failed_state = {**state, "error_message": "缺少解析数据"}
@@ -876,7 +921,36 @@ class FlowControlModelNode:
                     value_to_intervals.setdefault(str(val), []).append(str(interval))
                 for val, intervals in value_to_intervals.items():
                     q = self._build_rag_query(sig_name, val)
-                    rag_queries.append({"signal": sig_name, "value": str(val), "query": q, "intervals": intervals})
+                    rag_queries.append(
+                        {
+                            "kind": "value",
+                            "signal": sig_name,
+                            "value": str(val),
+                            "query": q,
+                            "intervals": intervals,
+                        }
+                    )
+
+                # 变化规则检索：提取相邻变化（如 1->2），为 tool2 提供“规则知识召回”入口
+                transitions = self._extract_transitions(windows or {})
+                for t in transitions:
+                    from_v = t.get("from", "")
+                    to_v = t.get("to", "")
+                    if not from_v or not to_v:
+                        continue
+                    for q in self._build_rag_transition_query(sig_name, from_v, to_v):
+                        rag_queries.append(
+                            {
+                                "kind": "transition",
+                                "signal": sig_name,
+                                "from": from_v,
+                                "to": to_v,
+                                "boundary_time": t.get("boundary_time", ""),
+                                "from_interval": t.get("from_interval", ""),
+                                "to_interval": t.get("to_interval", ""),
+                                "query": q,
+                            }
+                        )
 
             # 仍保留原来 flow_analysis 的字段，避免前端/结果结构断裂
             analysis_result = {
@@ -992,12 +1066,17 @@ class RAGRetrievalNode:
         self._rag_service = get_rag_service()
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
-        """处理RAG检索"""
+        """ReAct-工具二：规则知识召回阶段（根据工具一产出的 value/transition 查询 RAG）。"""
         problem_direction = state.get('problem_direction', '')
         df = state.get('parsed_data')
         rag_queries = state.get("rag_queries") or []
         iteration = int(state.get("iteration") or 0)
-        mark_node_started(state, "rag_retrieval", f"检索知识库（第{iteration + 1}轮）", {"iteration": iteration, "query_count": len(rag_queries)})
+        mark_node_started(
+            state,
+            "rag_retrieval",
+            f"ReAct-规则知识召回（第{iteration + 1}轮）",
+            {"iteration": iteration, "phase": "act_rule_recall", "query_count": len(rag_queries)},
+        )
         
         try:
             if state.get('progress_callback'):
@@ -1145,14 +1224,20 @@ class DetailedAnalysisNode:
                 self._llm_client = None
     
     async def process(self, state: ChargingAnalysisState) -> ChargingAnalysisState:
-        """处理细化分析"""
+        """ReAct-工具三：反思规划阶段（评估置信度 + 规划下一轮需要补充的关联信号）。"""
         problem_direction = state.get('problem_direction', '')
         context = state.get('retrieval_context', '')
         df = state.get('parsed_data')
         iteration = int(state.get('iteration', 0) or 0)
-        mark_node_started(state, "detailed_analysis", f"细化分析（第{iteration + 1}轮）", {"iteration": iteration})
+        mark_node_started(
+            state,
+            "detailed_analysis",
+            f"ReAct-反思规划（第{iteration + 1}轮）",
+            {"iteration": iteration, "phase": "reason_reflect_plan"},
+        )
         
-        if iteration >= self.max_iterations:
+        # iteration 为 0-based（第1轮 iteration=0）；最多 self.max_iterations 轮
+        if iteration >= (self.max_iterations - 1):
             if state.get('progress_callback'):
                 await state['progress_callback']("细化分析", 85, "达到最大迭代次数")
             
@@ -1171,25 +1256,47 @@ class DetailedAnalysisNode:
             if state.get('progress_callback'):
                 await state['progress_callback']("细化分析", 85, f"细化分析（第{iteration+1}轮）")
 
-            # 1) 先用“已有数据列+问题方向”给出一个基础候选信号集（兜底）
-            refined_signals = await self._extract_refined_signals(problem_direction, context, df)
-            signal_validation = await self._validate_signals(df, refined_signals)
+            # 1) 仅用工具数据（已解析列）做信号可用性校验，避免“凭空建议信号”
+            refined_signals = []
+            signal_validation = {"validated": True, "signal_count": 0, "results": [], "average_quality": 0.0}
+            try:
+                metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+                available_columns = [str(c) for c in (df.columns if df is not None else []) if str(c) not in metadata_columns]
+                # 兜底：取少量可用列作为“已知信号集合”提示给 tool3
+                refined_signals = available_columns[:20]
+                signal_validation = await self._validate_signals(df, refined_signals)
+            except Exception:
+                refined_signals = []
 
             # 2) 把流程控制生成的“时间段->值”和 RAG 证据统一交给 LLM 细化分析，产出置信度与“需要更多哪些信号”
             windows_list = state.get("signal_windows_list") or []
             rule_meta = state.get("signal_rule_meta") or {}
             retrieval_by_query = state.get("retrieval_by_query") or {}
-            refine = await self._llm_refine(problem_direction, windows_list, rule_meta, retrieval_by_query, signal_validation)
+            refine = await self._llm_refine(problem_direction, windows_list, rule_meta, retrieval_by_query, signal_validation, df)
             refine_conf = float(refine.get("confidence") or 0.0)
             needed = refine.get("needed_signals") or []
             if not isinstance(needed, list):
                 needed = []
             needed = [str(x) for x in needed if str(x).strip()]
+            # 只允许输出“在工具数据中确实存在”的信号，避免 LLM 幻觉
+            try:
+                if df is not None:
+                    cols = [str(c) for c in df.columns]
+                    cols_norm = {str(c).lower(): str(c) for c in cols}
+                    filtered: List[str] = []
+                    for s in needed:
+                        hit = cols_norm.get(str(s).lower())
+                        if hit and hit not in filtered:
+                            filtered.append(hit)
+                    needed = filtered
+            except Exception:
+                pass
 
             if state.get('progress_callback'):
                 await state['progress_callback']("细化分析", 90, f"细化分析完成（置信度{refine_conf:.0%}）")
 
             # 3) 若置信度不足且未超过3轮，则准备下一轮回到 flow_control
+            # 最多 3 轮：只有在下一轮仍在允许范围内才回环
             should_loop = refine_conf < 0.7 and (iteration + 1) < self.max_iterations and bool(needed)
             next_iteration = iteration + 1 if should_loop else iteration
 
@@ -1199,8 +1306,11 @@ class DetailedAnalysisNode:
                 "signal_validation": signal_validation,
                 "refine_result": refine,
                 "refine_confidence": refine_conf,
-                "additional_signals": needed,
-                "analysis_status": AnalysisStatus.PROCESSING if should_loop else AnalysisStatus.COMPLETED,
+                # 关键：若不允许继续回环（达到 3 轮或无 needed），必须清空 additional_signals，避免 conditional edge 误回环
+                "additional_signals": needed if should_loop else [],
+                "analysis_status": AnalysisStatus.PROCESSING if should_loop else (
+                    AnalysisStatus.MAX_ITERATIONS if refine_conf < 0.7 and (iteration + 1) >= self.max_iterations else AnalysisStatus.COMPLETED
+                ),
                 "iteration": next_iteration,
                 # 下一轮让 flow_control 按同样规则处理这些信号（大小写不敏感）
                 "signals_to_process": needed if should_loop else (state.get("signals_to_process") or []),
@@ -1231,6 +1341,7 @@ class DetailedAnalysisNode:
         rule_meta: Dict[str, Any],
         retrieval_by_query: Dict[str, List[Dict[str, Any]]],
         validation: Dict[str, Any],
+        df: pd.DataFrame | None,
     ) -> Dict[str, Any]:
         """LLM 细化分析：输出 conclusion/confidence/needed_signals。未配置时返回 mock。"""
         # mock
@@ -1257,12 +1368,22 @@ class DetailedAnalysisNode:
                 "direction": direction or "general_analysis",
             }
 
+        # 仅允许从“工具已解析出的列名”中选择 needed_signals（防止幻觉）
+        available_signals: List[str] = []
+        try:
+            if df is not None:
+                metadata_columns = {'timestamp', 'ts', 'time', 'Time', 'can_id', 'message_name', 'dlc'}
+                available_signals = [str(c) for c in df.columns if str(c) not in metadata_columns]
+        except Exception:
+            available_signals = []
+
         prompt = {
             "direction": direction or "general_analysis",
             "signal_windows": windows_list,
             "signal_rule_meta": rule_meta,
             "rag_evidence": retrieval_by_query,
             "signal_validation": validation or {},
+            "available_signals": available_signals,
             "requirements": {
                 "confidence_threshold": 0.7,
                 "max_iterations": self.max_iterations,
@@ -1278,10 +1399,10 @@ class DetailedAnalysisNode:
             {
                 "role": "system",
                 "content": (
-                    "你是充电系统诊断专家。"
-                    "输入包含关键信号的时间段值变化、枚举释义与知识库检索证据。"
-                    "请给出：1)当前阶段性结论(conclusion) 2)置信度(confidence 0~1) "
-                    "3)为了更好定性问题还需要哪些信号明细(needed_signals)。"
+                    "你在执行 ReAct 的“反思规划”步骤：只允许基于输入中的工具证据做判断。"
+                    "输入包含：关键信号时间段变化、枚举释义、RAG 检索证据，以及可用信号列表(available_signals)。"
+                    "任务：评估当前结论的置信度（0~1），并规划下一轮需要补充的关联信号 needed_signals。"
+                    "严禁引入任何未在输入中出现的数据/事实；若证据不足请降低 confidence，并把 needed_signals 严格限制在 available_signals 之内。"
                     "必须返回严格 JSON 对象，字段仅包含 conclusion/confidence/needed_signals。"
                 ),
             },
@@ -1624,7 +1745,11 @@ class LLMAnalysisNode:
             "1) 是否是标准2015充电桩？\n"
             "2) 整个充电流程有问题吗？是车的问题还是桩的问题？哪个阶段有什么问题？\n"
             "3) 可能的原因及优化建议？\n"
-            "注意：若证据不足可返回 unknown/null，但要降低 confidence。\n"
+            "硬性约束：只能使用输入 JSON 内的工具证据（signal_windows / rag_evidence / data_stats 等）进行推理，禁止引入任何外部常识或未出现的数据。\n"
+            "证据要求：你的每条 stage_breakdown / root_causes / recommendations 都应给出 evidence，evidence 必须引用：\n"
+            "- 信号时间段（例如 \"BMS_DCChrgSt 10:01:02-10:03:10=3\"）或\n"
+            "- RAG 命中文档（例如 \"[score] filename@row snippet\"，可直接使用输入中的 rag_evidence 片段）。\n"
+            "若证据不足必须返回 unknown/null，并显著降低 confidence。\n"
             + json.dumps(payload, ensure_ascii=False)
         )
         return prompt
@@ -1640,7 +1765,14 @@ class LLMAnalysisNode:
                 messages = [
                     {
                         "role": "system",
-                        "content": "你是一个专业的充电系统分析专家。请根据提供的充电数据分析结果，生成详细的诊断报告。必须以有效的 JSON 格式返回结果，包含以下字段：summary（诊断总结）、findings（关键发现列表）、risk_assessment（风险评估）、recommendations（建议措施列表）、technical_details（技术细节）。"
+                        "content": (
+                            "你是一个专业的充电系统分析专家。"
+                            "你只能使用用户提供的工具证据（信号窗口、RAG证据、统计信息）进行推理，禁止引入任何外部知识或未出现的数据。"
+                            "若证据不足，必须输出 unknown/null 并降低置信度。"
+                            "必须以有效的 JSON 格式返回结果，包含以下字段："
+                            "summary（诊断总结）、findings（关键发现列表）、risk_assessment（风险评估）、"
+                            "recommendations（建议措施列表）、technical_details（技术细节）。"
+                        )
                     },
                     {
                         "role": "user",
@@ -2019,8 +2151,8 @@ class ChargingAnalysisWorkflow:
         if conf >= 0.7:
             return "llm_analysis"
 
-        # 超过最大轮次：也进入最终 LLM（但置信度低，结论需要提示不确定）
-        if iteration >= 3:
+        # 最多 3 轮（iteration 0-based）：达到上限后强制进入最终 LLM
+        if (iteration + 1) >= 3:
             return "llm_analysis"
 
         # 有可补充信号：回到流程控制继续
