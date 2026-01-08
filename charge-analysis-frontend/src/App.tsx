@@ -697,16 +697,53 @@ const ChargingPage = () => {
   };
 
   const getTraceStatus = (stepId: string): 'pending' | 'active' | 'completed' | 'failed' | null => {
-    const trace = workflowTrace?.[stepId];
+    // stepId 可能是 nodeId 或 nodeId::run:N
+    const parsed = parseStepKey(stepId);
+    const trace = workflowTrace?.[parsed.nodeId];
     if (!trace) return null;
-    if (trace.status === 'completed') return 'completed';
-    if (trace.status === 'failed') return 'failed';
-    if (trace.status === 'running') return 'active';
-    if (trace.status === 'pending') return 'pending';
+    const run = parsed.runIndex ? (Array.isArray(trace.runs) ? trace.runs[parsed.runIndex - 1] : null) : null;
+    const status = String(run?.status || trace.status || '');
+    if (status === 'completed') return 'completed';
+    if (status === 'failed') return 'failed';
+    if (status === 'running') return 'active';
+    if (status === 'pending') return 'pending';
     return null;
   };
 
-  const getTraceEntry = (stepId: string) => workflowTrace?.[stepId];
+  const parseStepKey = (stepId: string): { nodeId: string; runIndex: number | null } => {
+    const raw = String(stepId || '');
+    const parts = raw.split('::run:');
+    if (parts.length === 2) {
+      const n = Number(parts[1]);
+      return { nodeId: parts[0], runIndex: Number.isFinite(n) ? n : null };
+    }
+    return { nodeId: raw, runIndex: null };
+  };
+
+  const getTraceEntry = (stepId: string) => {
+    const parsed = parseStepKey(stepId);
+    const entry = workflowTrace?.[parsed.nodeId];
+    if (!entry) return null;
+
+    // 若选择的是某一轮 run，则把该 run“投影”为一个可展示的 trace（兼容 renderTraceInfo）
+    if (parsed.runIndex && Array.isArray(entry.runs) && entry.runs[parsed.runIndex - 1]) {
+      const run = entry.runs[parsed.runIndex - 1];
+      return {
+        ...entry,
+        // 让详情卡片与渲染逻辑聚焦“这一轮”
+        runs: [run],
+        started_at: run?.started_at || entry.started_at,
+        ended_at: run?.ended_at || entry.ended_at,
+        status: run?.status || entry.status,
+        description: run?.description || entry.description,
+        metadata: run?.metadata || entry.metadata,
+        output: run?.output || entry.output,
+        error: run?.error || entry.error
+      };
+    }
+
+    return entry;
+  };
 
   // --- 流程展示（动态适配后端 langgraph 变化） ---
   // 1) fallbackWorkflowSteps：当后端尚未返回 workflow_trace 时，仍用“进度区间”做粗略展示（避免空白）
@@ -799,6 +836,72 @@ const ChargingPage = () => {
     });
   }, [workflowTrace, getTraceStatus, getWorkflowIcon]);
 
+  // 把 workflow_trace 展开为“卡片实例列表”：
+  // - 同一节点多次执行（runs）会生成多张卡片（nodeId::run:N）
+  // - 卡片按 started_at 排序，更贴近真实执行顺序（尤其是 ReAct 回环）
+  // - 没有 started_at 的 pending 节点会被追加到末尾（保持可预期的流程感）
+  const buildWorkflowCardInstances = React.useCallback(() => {
+    const raw = workflowTrace || {};
+    const startedCards: any[] = [];
+    const pendingCards: any[] = [];
+
+    Object.entries(raw).forEach(([key, value]: [string, any]) => {
+      const entry = value || {};
+      const nodeId = String(entry.node_id || key);
+      const nodeName = String(entry.name || nodeId);
+      if (nodeId === 'file_upload') return; // 顶部单独的文件卡片已经覆盖
+
+      const runs = Array.isArray(entry.runs) ? entry.runs : [];
+      if (runs.length > 0) {
+        runs.forEach((r: any, idx: number) => {
+          const startedAt = r?.started_at || entry?.started_at;
+          const status = String(r?.status || entry?.status || 'pending');
+          const stepId = `${nodeId}::run:${idx + 1}`;
+          const card = {
+            id: stepId,
+            nodeId,
+            runIndex: idx + 1,
+            name: nodeName,
+            // 卡片标题尽量用“真实描述”，否则用默认 name
+            displayName: r?.description ? String(r.description) : nodeName,
+            icon: getWorkflowIcon(nodeId),
+            status: status === 'running' ? 'active' : status,
+            startedAt
+          };
+          if (startedAt) {
+            startedCards.push(card);
+          } else {
+            // 极端情况：run 没有 started_at，就当 pending 放后面
+            pendingCards.push({ ...card, status: 'pending' });
+          }
+        });
+      } else {
+        // 没有 runs：单次执行节点，生成一个卡片（nodeId）
+        const startedAt = entry?.started_at;
+        const status = String(entry?.status || 'pending');
+        const card = {
+          id: nodeId,
+          nodeId,
+          runIndex: null,
+          name: nodeName,
+          displayName: entry?.description ? String(entry.description) : nodeName,
+          icon: getWorkflowIcon(nodeId),
+          status: status === 'running' ? 'active' : status,
+          startedAt
+        };
+        if (startedAt) startedCards.push(card);
+        else pendingCards.push({ ...card, status: 'pending' });
+      }
+    });
+
+    startedCards.sort((a, b) => safeParseTime(a.startedAt) - safeParseTime(b.startedAt));
+    // pendingCards 按 name 排序即可（不强行定义拓扑顺序，避免写死流程）
+    pendingCards.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    // 若 file_validation/message_parsing 等在 trace 内但尚未开始，会出现在 pendingCards 里
+    return [...startedCards, ...pendingCards];
+  }, [workflowTrace, getWorkflowIcon]);
+
   // 根据进度获取当前步骤
   const getCurrentSteps = () => {
     if (!file) return [];
@@ -815,16 +918,17 @@ const ChargingPage = () => {
 
     // 优先：从 workflow_trace 动态构建步骤（自动适配 langgraph 节点增删/回环）
     if (hasTrace) {
-      const dynamic = buildWorkflowStepsFromTrace();
-      // 过滤掉 file_upload（已在上方单独卡片展示）
-      for (const s of dynamic) {
-        if (s.id === 'file_upload') continue;
+      const cards = buildWorkflowCardInstances();
+      for (const c of cards) {
         steps.push({
-          id: s.id,
-          name: s.name,
-          icon: s.icon,
-          status: s.status,
-          isReact: s.isReact
+          id: c.id,
+          // 卡片展示优先用 displayName（更贴近 ReAct 每轮做了什么）
+          name: c.displayName || c.name,
+          icon: c.icon,
+          status: c.status,
+          // 让 UI 更容易区分“同一节点的多轮”
+          runIndex: c.runIndex,
+          nodeId: c.nodeId
         });
       }
       return steps;
@@ -1009,6 +1113,18 @@ const ChargingPage = () => {
 
   // 获取步骤的详细信息
   const getStepDetails = (stepId: string) => {
+    // 若点击的是某一轮 run（nodeId::run:N），优先展示“该轮的 trace 信息”，避免被写死的分支覆盖
+    const parsed = parseStepKey(stepId);
+    if (parsed.runIndex) {
+      const trace = getTraceEntry(stepId);
+      return {
+        title: `${trace?.name || parsed.nodeId}（第${parsed.runIndex}轮）`,
+        data: {
+          trace
+        }
+      };
+    }
+
     // 文件上传步骤不需要 analysisData
     if (stepId === 'file_upload') {
       return {
@@ -1977,6 +2093,21 @@ const ChargingPage = () => {
                     }}>
                       {step.name}
                     </span>
+                    {/* 多轮执行的徽标（例如 flow_control::run:2） */}
+                    {step.runIndex && (
+                      <Tag
+                        color="#2c5aa0"
+                        style={{
+                          marginRight: 0,
+                          fontSize: '11px',
+                          lineHeight: '16px',
+                          padding: '0 6px',
+                          height: '18px'
+                        }}
+                      >
+                        第{step.runIndex}轮
+                      </Tag>
+                    )}
                     {isCompleted && (
                       <CheckCircleOutlined style={{ 
                         fontSize: '16px', 
