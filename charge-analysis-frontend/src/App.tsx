@@ -1,6 +1,6 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, Link } from 'react-router-dom';
-import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Modal, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag } from 'antd';
+import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Modal, Select, Spin, Card, Space, Typography, Progress, Tabs, Table, Tag, Empty } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import ReactECharts from 'echarts-for-react';
@@ -708,8 +708,10 @@ const ChargingPage = () => {
 
   const getTraceEntry = (stepId: string) => workflowTrace?.[stepId];
 
-  // 定义流程节点
-  const workflowSteps = [
+  // --- 流程展示（动态适配后端 langgraph 变化） ---
+  // 1) fallbackWorkflowSteps：当后端尚未返回 workflow_trace 时，仍用“进度区间”做粗略展示（避免空白）
+  // 2) 一旦 workflow_trace 可用：步骤列表完全来自 workflow_trace（节点增删/回环都能自动适配）
+  const fallbackWorkflowSteps = [
     { id: 'file_upload', name: '文件上传', icon: FileOutlined, progressRange: [0, 10] },
     { id: 'file_validation', name: '文件验证', icon: CheckOutlined, progressRange: [10, 20] },
     { id: 'message_parsing', name: '报文解析', icon: CodeOutlined, progressRange: [20, 50] },
@@ -717,8 +719,85 @@ const ChargingPage = () => {
     { id: 'rag_retrieval', name: 'RAG检索', icon: SearchOutlined, progressRange: [60, 80] },
     { id: 'detailed_analysis', name: '细化分析', icon: ToolOutlined, progressRange: [80, 90] },
     { id: 'llm_analysis', name: 'LLM分析', icon: RobotOutlined, progressRange: [90, 95] },
-    { id: 'report_generation', name: '报告生成', icon: FileTextOutlined, progressRange: [95, 100] },
+    { id: 'report_generation', name: '报告生成', icon: FileTextOutlined, progressRange: [95, 100] }
   ];
+
+  // 已知节点的图标映射；后端新增节点时自动回退到默认图标（不影响展示）
+  const workflowIconMap: Record<string, any> = React.useMemo(
+    () => ({
+      file_upload: FileOutlined,
+      file_validation: CheckOutlined,
+      message_parsing: CodeOutlined,
+      flow_control: ControlOutlined,
+      rag_retrieval: SearchOutlined,
+      detailed_analysis: ToolOutlined,
+      llm_analysis: RobotOutlined,
+      report_generation: FileTextOutlined
+    }),
+    []
+  );
+
+  const getWorkflowIcon = React.useCallback(
+    (nodeId: string) => workflowIconMap[nodeId] || ThunderboltOutlined,
+    [workflowIconMap]
+  );
+
+  const safeParseTime = (value?: string): number => {
+    if (!value) return Number.POSITIVE_INFINITY;
+    const t = new Date(value).getTime();
+    return Number.isFinite(t) ? t : Number.POSITIVE_INFINITY;
+  };
+
+  const getEntryFirstStartedAt = (entry: any): string | undefined => {
+    // 后端支持循环：优先用 runs[0].started_at 作为“首次出现时间”
+    const runs = Array.isArray(entry?.runs) ? entry.runs : [];
+    return runs?.[0]?.started_at || entry?.started_at;
+  };
+
+  const isReactLikeStep = (entry: any): boolean => {
+    // 识别 ReAct：优先看 metadata.phase，其次看 description 文案
+    const desc = String(entry?.description || '');
+    const meta = entry?.metadata || {};
+    return Boolean(meta?.phase) || desc.toLowerCase().includes('react');
+  };
+
+  const buildWorkflowStepsFromTrace = React.useCallback(() => {
+    const raw = workflowTrace || {};
+    const entries = Object.entries(raw).map(([key, value]: [string, any]) => {
+      const v = value || {};
+      const id = String(v.node_id || key);
+      return {
+        id,
+        name: String(v.name || id),
+        trace: v
+      };
+    });
+
+    // 排序规则：
+    // - file_upload 永远最前（符合用户直觉）
+    // - 其余按首次 started_at 升序（更接近真实执行顺序）
+    // - 没有 started_at 的（pending）排在最后
+    const sorted = entries.sort((a, b) => {
+      if (a.id === 'file_upload') return -1;
+      if (b.id === 'file_upload') return 1;
+      const ta = safeParseTime(getEntryFirstStartedAt(a.trace));
+      const tb = safeParseTime(getEntryFirstStartedAt(b.trace));
+      if (ta !== tb) return ta - tb;
+      return a.name.localeCompare(b.name);
+    });
+
+    return sorted.map((item) => {
+      const status = getTraceStatus(item.id) || 'pending';
+      return {
+        id: item.id,
+        name: item.name,
+        icon: getWorkflowIcon(item.id),
+        status,
+        isReact: isReactLikeStep(item.trace),
+        trace: item.trace
+      };
+    });
+  }, [workflowTrace, getTraceStatus, getWorkflowIcon]);
 
   // 根据进度获取当前步骤
   const getCurrentSteps = () => {
@@ -729,35 +808,43 @@ const ChargingPage = () => {
     
     // 文件上传步骤（始终显示）
     steps.push({
-      ...workflowSteps[0],
+      ...fallbackWorkflowSteps[0],
       status: 'completed',
       data: { fileName: file?.name, fileSize: file?.size }
     });
 
-    // 如果已上传，显示文件验证
+    // 优先：从 workflow_trace 动态构建步骤（自动适配 langgraph 节点增删/回环）
+    if (hasTrace) {
+      const dynamic = buildWorkflowStepsFromTrace();
+      // 过滤掉 file_upload（已在上方单独卡片展示）
+      for (const s of dynamic) {
+        if (s.id === 'file_upload') continue;
+        steps.push({
+          id: s.id,
+          name: s.name,
+          icon: s.icon,
+          status: s.status,
+          isReact: s.isReact
+        });
+      }
+      return steps;
+    }
+
+    // fallback：无 trace 时仍用进度区间展示（避免“分析中但步骤空白”）
     if (status === 'uploaded' || status === 'analyzing' || status === 'completed') {
+      // 文件验证（上传后默认认为已完成；开始分析后按进度活跃）
       const validationStatus = getTraceStatus('file_validation');
       steps.push({
-        ...workflowSteps[1],
+        ...fallbackWorkflowSteps[1],
         status: validationStatus || (status === 'uploaded' ? 'completed' : status === 'analyzing' ? 'active' : 'pending')
       });
     }
 
-    // 根据进度显示其他步骤
-    if (hasTrace) {
-      for (let i = 2; i < workflowSteps.length; i++) {
-        const step = workflowSteps[i];
-        const traceStatus = getTraceStatus(step.id) || 'pending';
-        steps.push({
-          ...step,
-          status: traceStatus
-        });
-      }
-    } else if (status === 'analyzing' || status === 'completed') {
+    if (status === 'analyzing' || status === 'completed') {
       const currentProgress = analysisProgress;
       
-      for (let i = 2; i < workflowSteps.length; i++) {
-        const step = workflowSteps[i];
+      for (let i = 2; i < fallbackWorkflowSteps.length; i++) {
+        const step = fallbackWorkflowSteps[i];
         const [min, max] = step.progressRange;
         
         if (currentProgress >= min) {
@@ -777,6 +864,147 @@ const ChargingPage = () => {
     }
 
     return steps;
+  };
+
+  // 执行过程时间线（按 started_at 排序，展示 ReAct 的回环 runs）
+  const buildTraceEvents = React.useCallback(() => {
+    const raw = workflowTrace || {};
+    const events: any[] = [];
+
+    Object.entries(raw).forEach(([key, value]: [string, any]) => {
+      const entry = value || {};
+      const nodeId = String(entry.node_id || key);
+      const nodeName = String(entry.name || nodeId);
+      const runs = Array.isArray(entry.runs) && entry.runs.length > 0 ? entry.runs : null;
+
+      const pushEvent = (run: any, runIndex: number | null) => {
+        const startedAt = run?.started_at || entry?.started_at;
+        if (!startedAt) return; // 没有开始时间的（纯 pending）不进入时间线
+        events.push({
+          nodeId,
+          nodeName,
+          runIndex,
+          status: String(run?.status || entry?.status || 'pending'),
+          startedAt,
+          endedAt: run?.ended_at || entry?.ended_at,
+          description: run?.description || entry?.description,
+          metadata: run?.metadata || entry?.metadata,
+          output: run?.output || entry?.output,
+          error: run?.error || entry?.error
+        });
+      };
+
+      if (runs) {
+        runs.forEach((r: any, idx: number) => pushEvent(r, idx + 1));
+      } else {
+        pushEvent(entry, null);
+      }
+    });
+
+    return events.sort((a, b) => safeParseTime(a.startedAt) - safeParseTime(b.startedAt));
+  }, [workflowTrace]);
+
+  const renderExecutionTimeline = () => {
+    const hasTrace = analysisData && Object.keys(workflowTrace || {}).length > 0;
+    if (!hasTrace) return null;
+    const events = buildTraceEvents();
+    if (!events.length) return null;
+
+    const statusColor = (s: string) => {
+      if (s === 'completed') return '#52c41a';
+      if (s === 'failed') return '#ff4d4f';
+      if (s === 'running') return '#2c5aa0';
+      return '#8c8c8c';
+    };
+
+    return (
+      <Card title="执行过程（按时间排序，自动适配 ReAct 回环）" style={{ marginTop: '24px', width: '100%' }}>
+        <div style={{ display: 'grid', gap: '10px' }}>
+          {events.map((ev, idx) => {
+            const isReact = Boolean(ev?.metadata?.phase) || String(ev?.description || '').toLowerCase().includes('react');
+            const runLabel = ev.runIndex ? `#${ev.runIndex}` : '';
+            return (
+              <div
+                key={`${ev.nodeId}-${ev.runIndex ?? 'single'}-${idx}`}
+                style={{
+                  border: `1px solid #f0f0f0`,
+                  borderLeft: `4px solid ${statusColor(ev.status)}`,
+                  borderRadius: '8px',
+                  padding: '10px 12px',
+                  background: '#fff'
+                }}
+              >
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
+                  <Tag color={statusColor(ev.status)} style={{ marginRight: 0 }}>
+                    {ev.status}
+                  </Tag>
+                  {isReact && (
+                    <Tag color="#2c5aa0" style={{ marginRight: 0 }}>
+                      ReAct
+                    </Tag>
+                  )}
+                  <Typography.Text strong style={{ cursor: 'pointer' }} onClick={() => setSelectedStep(ev.nodeId)}>
+                    {ev.nodeName}{runLabel ? ` ${runLabel}` : ''}
+                  </Typography.Text>
+                  {ev.startedAt && (
+                    <Typography.Text type="secondary">
+                      开始：{formatDateTime(ev.startedAt)}
+                    </Typography.Text>
+                  )}
+                  {ev.endedAt && (
+                    <Typography.Text type="secondary">
+                      结束：{formatDateTime(ev.endedAt)}
+                    </Typography.Text>
+                  )}
+                </div>
+
+                {ev.description && (
+                  <Typography.Text style={{ display: 'block', marginTop: '6px', color: '#595959' }}>
+                    {ev.description}
+                  </Typography.Text>
+                )}
+
+                {/* 只展示“必要信息”：metadata/output/error 的精简版文本，避免铺满屏幕 */}
+                {(ev.metadata || ev.output || ev.error) && (
+                  <div style={{ marginTop: '8px', display: 'grid', gap: '6px' }}>
+                    {ev.metadata && (
+                      <div style={{ background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: '6px', padding: '8px' }}>
+                        <Typography.Text type="secondary" style={{ display: 'block', marginBottom: '4px' }}>
+                          metadata
+                        </Typography.Text>
+                        <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                          {toDisplayText(ev.metadata)}
+                        </Typography.Text>
+                      </div>
+                    )}
+                    {ev.output && (
+                      <div style={{ background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: '6px', padding: '8px' }}>
+                        <Typography.Text type="secondary" style={{ display: 'block', marginBottom: '4px' }}>
+                          output
+                        </Typography.Text>
+                        <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                          {toDisplayText(ev.output)}
+                        </Typography.Text>
+                      </div>
+                    )}
+                    {ev.error && (
+                      <div style={{ background: '#fff1f0', border: '1px solid #ffccc7', borderRadius: '6px', padding: '8px' }}>
+                        <Typography.Text type="secondary" style={{ display: 'block', marginBottom: '4px' }}>
+                          error
+                        </Typography.Text>
+                        <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                          {toDisplayText(ev.error)}
+                        </Typography.Text>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    );
   };
 
   // 获取步骤的详细信息
@@ -2788,20 +3016,59 @@ const ChargingPage = () => {
                     </div>
                   );
                 
-                default:
+                default: {
+                  // 动态节点兜底：后端 langgraph 新增/调整节点时，前端无需改代码也能展示必要信息
+                  const trace = getTraceEntry(selectedStep);
+                  const lastRun =
+                    trace && Array.isArray(trace.runs) && trace.runs.length
+                      ? trace.runs[trace.runs.length - 1]
+                      : null;
+                  const meta = lastRun?.metadata || trace?.metadata;
+                  const output = lastRun?.output || trace?.output;
+                  const err = lastRun?.error || trace?.error;
+
                   return (
                     <div>
-                      <pre style={{ 
-                        background: '#f5f5f5', 
-                        padding: '16px', 
-                        borderRadius: '4px',
-                        overflow: 'auto',
-                        maxHeight: '400px'
-                      }}>
-                        {JSON.stringify(details.data, null, 2)}
-                      </pre>
+                      {renderTraceInfo(trace)}
+                      {(meta || output || err) ? (
+                        <div style={{ display: 'grid', gap: '12px' }}>
+                          {meta && (
+                            <div style={{ background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: '8px', padding: '12px' }}>
+                              <Typography.Text strong style={{ display: 'block', marginBottom: '6px' }}>
+                                metadata
+                              </Typography.Text>
+                              <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                                {toDisplayText(meta)}
+                              </Typography.Text>
+                            </div>
+                          )}
+                          {output && (
+                            <div style={{ background: '#fafafa', border: '1px solid #f0f0f0', borderRadius: '8px', padding: '12px' }}>
+                              <Typography.Text strong style={{ display: 'block', marginBottom: '6px' }}>
+                                output
+                              </Typography.Text>
+                              <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                                {toDisplayText(output)}
+                              </Typography.Text>
+                            </div>
+                          )}
+                          {err && (
+                            <div style={{ background: '#fff1f0', border: '1px solid #ffccc7', borderRadius: '8px', padding: '12px' }}>
+                              <Typography.Text strong style={{ display: 'block', marginBottom: '6px' }}>
+                                error
+                              </Typography.Text>
+                              <Typography.Text style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '12px' }}>
+                                {toDisplayText(err)}
+                              </Typography.Text>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <Empty description="暂无可展示的节点信息" />
+                      )}
                     </div>
                   );
+                }
               }
             })()}
           </Card>
@@ -2932,6 +3199,9 @@ const ChargingPage = () => {
           </div>
         </Card>
       )}
+
+      {/* 执行过程时间线：展示后端 langgraph/ReAct 的动态过程（不依赖写死节点） */}
+      {(status === 'analyzing' || status === 'completed' || status === 'failed' || status === 'error') && renderExecutionTimeline()}
 
       {/* Status Section - shown for other statuses */}
       {status !== 'idle' && status !== 'analyzing' && (
