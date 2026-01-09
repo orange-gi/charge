@@ -697,21 +697,9 @@ const ChargingPage = () => {
     );
   };
 
-  const getTraceStatus = (stepId: string): 'pending' | 'active' | 'completed' | 'failed' | null => {
-    // stepId 可能是 nodeId 或 nodeId::run:N
-    const parsed = parseStepKey(stepId);
-    const trace = workflowTrace?.[parsed.nodeId];
-    if (!trace) return null;
-    const run = parsed.runIndex ? (Array.isArray(trace.runs) ? trace.runs[parsed.runIndex - 1] : null) : null;
-    const status = String(run?.status || trace.status || '');
-    if (status === 'completed') return 'completed';
-    if (status === 'failed') return 'failed';
-    if (status === 'running') return 'active';
-    if (status === 'pending') return 'pending';
-    return null;
-  };
-
-  const parseStepKey = (stepId: string): { nodeId: string; runIndex: number | null } => {
+  // stepId 可能是 nodeId 或 nodeId::run:N
+  // 注意：这里使用 function 声明，保证引用稳定，避免 useEffect 依赖链导致无限更新
+  function parseStepKey(stepId: string): { nodeId: string; runIndex: number | null } {
     const raw = String(stepId || '');
     const parts = raw.split('::run:');
     if (parts.length === 2) {
@@ -719,7 +707,23 @@ const ChargingPage = () => {
       return { nodeId: parts[0], runIndex: Number.isFinite(n) ? n : null };
     }
     return { nodeId: raw, runIndex: null };
-  };
+  }
+
+  const getTraceStatus = React.useCallback(
+    (stepId: string): 'pending' | 'active' | 'completed' | 'failed' | null => {
+      const parsed = parseStepKey(stepId);
+      const trace = workflowTrace?.[parsed.nodeId];
+      if (!trace) return null;
+      const run = parsed.runIndex ? (Array.isArray(trace.runs) ? trace.runs[parsed.runIndex - 1] : null) : null;
+      const status = String(run?.status || trace.status || '');
+      if (status === 'completed') return 'completed';
+      if (status === 'failed') return 'failed';
+      if (status === 'running') return 'active';
+      if (status === 'pending') return 'pending';
+      return null;
+    },
+    [workflowTrace]
+  );
 
   const getTraceEntry = (stepId: string) => {
     const parsed = parseStepKey(stepId);
