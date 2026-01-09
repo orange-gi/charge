@@ -4,6 +4,7 @@ import { ConfigProvider, Layout as AntLayout, Menu, Button, message, Modal, Sele
 import zhCN from 'antd/locale/zh_CN';
 import { UserOutlined, FileTextOutlined, DatabaseOutlined, LogoutOutlined, UploadOutlined, FileOutlined, CloseOutlined, MenuFoldOutlined, MenuUnfoldOutlined, ThunderboltOutlined, PlusOutlined, MessageOutlined, CheckCircleOutlined, ReloadOutlined, DeleteOutlined, CheckOutlined, CodeOutlined, ControlOutlined, SearchOutlined, ToolOutlined, RobotOutlined, CloseCircleOutlined } from '@ant-design/icons';
 import ReactECharts from 'echarts-for-react';
+import type { CSSProperties } from 'react';
 import { useAuthStore } from './stores/authStore';
 import './styles/globals.css';
 import TrainingCenter from './pages/training/TrainingCenter';
@@ -751,11 +752,11 @@ const ChargingPage = () => {
   const fallbackWorkflowSteps = [
     { id: 'file_upload', name: '文件上传', icon: FileOutlined, progressRange: [0, 10] },
     { id: 'file_validation', name: '文件验证', icon: CheckOutlined, progressRange: [10, 20] },
-    { id: 'message_parsing', name: '报文解析', icon: CodeOutlined, progressRange: [20, 50] },
-    { id: 'flow_control', name: '流程控制', icon: ControlOutlined, progressRange: [50, 60] },
-    { id: 'rag_retrieval', name: 'RAG检索', icon: SearchOutlined, progressRange: [60, 80] },
-    { id: 'detailed_analysis', name: '细化分析', icon: ToolOutlined, progressRange: [80, 90] },
-    { id: 'llm_analysis', name: 'LLM分析', icon: RobotOutlined, progressRange: [90, 95] },
+    // 按用户期望的“规范拓扑顺序”展示（避免旧命名/旧顺序残留）
+    { id: 'message_parsing', name: '信号解析', icon: CodeOutlined, progressRange: [20, 50] },
+    { id: 'rag_retrieval', name: '知识检索', icon: SearchOutlined, progressRange: [50, 75] },
+    { id: 'llm_analysis', name: 'LLM分析', icon: RobotOutlined, progressRange: [75, 90] },
+    { id: 'flow_control', name: '流程控制', icon: ControlOutlined, progressRange: [90, 95] },
     { id: 'report_generation', name: '报告生成', icon: FileTextOutlined, progressRange: [95, 100] }
   ];
 
@@ -902,6 +903,85 @@ const ChargingPage = () => {
     return [...startedCards, ...pendingCards];
   }, [workflowTrace, getWorkflowIcon]);
 
+  const canonicalNodeDisplayName = React.useCallback((nodeId: string) => {
+    const map: Record<string, string> = {
+      file_validation: '文件验证',
+      message_parsing: '信号解析',
+      rag_retrieval: '知识检索',
+      llm_analysis: 'LLM分析',
+      flow_control: '流程控制',
+      report_generation: '报告生成'
+    };
+    return map[nodeId] || nodeId;
+  }, []);
+
+  const canonicalNodeOrder = React.useMemo(
+    () => ['file_validation', 'message_parsing', 'rag_retrieval', 'llm_analysis', 'flow_control', 'report_generation'],
+    []
+  );
+
+  const hasSecondRoundReactLoop = React.useMemo(() => {
+    const raw = workflowTrace || {};
+    const loopNodes = ['message_parsing', 'rag_retrieval', 'llm_analysis', 'flow_control'];
+    return loopNodes.some((k) => {
+      const entry: any = raw?.[k];
+      const runs = Array.isArray(entry?.runs) ? entry.runs : [];
+      return runs.length >= 2;
+    });
+  }, [workflowTrace]);
+
+  const buildCanonicalWorkflowRows = React.useCallback(() => {
+    // 规则（用户定义）：
+    // - 无第二轮：单行按固定拓扑展示（去掉 detailed_analysis 等非展示节点）
+    // - 有第二轮：两行 10 卡片
+    //   第一行：文件验证 -> 信号解析(第1轮) -> 知识检索(第1轮) -> LLM分析(第1轮) -> 流程控制(第1轮)
+    //   第二行：信号解析(第2轮) -> 知识检索(第2轮) -> LLM分析(第2轮) -> 流程控制(第2轮) -> 报告生成
+    const raw = workflowTrace || {};
+
+    const makeStep = (nodeId: string, runIndex: number | null) => {
+      const entry: any = raw?.[nodeId] || {};
+      const hasRuns = Array.isArray(entry?.runs) && entry.runs.length > 0;
+      const stepId = runIndex && hasRuns ? `${nodeId}::run:${runIndex}` : nodeId;
+      const status = getTraceStatus(stepId) || 'pending';
+      return {
+        id: stepId,
+        nodeId,
+        runIndex,
+        name: canonicalNodeDisplayName(nodeId),
+        icon: getWorkflowIcon(nodeId),
+        status
+      };
+    };
+
+    if (!hasSecondRoundReactLoop) {
+      const single = canonicalNodeOrder.map((nodeId) => makeStep(nodeId, null));
+      return { mode: 'single' as const, rows: [single] };
+    }
+
+    const row1 = [
+      makeStep('file_validation', null),
+      makeStep('message_parsing', 1),
+      makeStep('rag_retrieval', 1),
+      makeStep('llm_analysis', 1),
+      makeStep('flow_control', 1)
+    ];
+    const row2 = [
+      makeStep('message_parsing', 2),
+      makeStep('rag_retrieval', 2),
+      makeStep('llm_analysis', 2),
+      makeStep('flow_control', 2),
+      makeStep('report_generation', null)
+    ];
+    return { mode: 'two_row' as const, rows: [row1, row2] };
+  }, [
+    workflowTrace,
+    hasSecondRoundReactLoop,
+    canonicalNodeOrder,
+    canonicalNodeDisplayName,
+    getWorkflowIcon,
+    getTraceStatus
+  ]);
+
   // 根据进度获取当前步骤
   const getCurrentSteps = () => {
     if (!file) return [];
@@ -918,17 +998,17 @@ const ChargingPage = () => {
 
     // 优先：从 workflow_trace 动态构建步骤（自动适配 langgraph 节点增删/回环）
     if (hasTrace) {
-      const cards = buildWorkflowCardInstances();
-      for (const c of cards) {
+      const layout = buildCanonicalWorkflowRows();
+      // UI 渲染会直接用 layout.rows，这里仍返回“扁平步骤”以兼容其它逻辑（例如详情面板/选中态）
+      const flattened = layout.rows.flat();
+      for (const s of flattened) {
         steps.push({
-          id: c.id,
-          // 卡片展示优先用 displayName（更贴近 ReAct 每轮做了什么）
-          name: c.displayName || c.name,
-          icon: c.icon,
-          status: c.status,
-          // 让 UI 更容易区分“同一节点的多轮”
-          runIndex: c.runIndex,
-          nodeId: c.nodeId
+          id: s.id,
+          name: s.name,
+          icon: s.icon,
+          status: s.status,
+          runIndex: s.runIndex,
+          nodeId: s.nodeId
         });
       }
       return steps;
@@ -1111,6 +1191,210 @@ const ChargingPage = () => {
     );
   };
 
+  // --- 两行流程卡片（ReAct 第二轮）跨行连线 ---
+  const flowContainerRef = React.useRef<HTMLDivElement | null>(null);
+  const flowCardRefs = React.useRef<Map<string, HTMLDivElement>>(new Map());
+  const [crossRowPath, setCrossRowPath] = React.useState<string | null>(null);
+  const [flowSvgSize, setFlowSvgSize] = React.useState<{ w: number; h: number }>({ w: 0, h: 0 });
+
+  const recomputeCrossRowPath = React.useCallback(() => {
+    const container = flowContainerRef.current;
+    if (!container) {
+      setCrossRowPath(null);
+      return;
+    }
+
+    const rectC = container.getBoundingClientRect();
+    setFlowSvgSize({ w: Math.max(1, rectC.width), h: Math.max(1, rectC.height) });
+
+    const layout = buildCanonicalWorkflowRows();
+    if (layout.mode !== 'two_row') {
+      setCrossRowPath(null);
+      return;
+    }
+
+    const row1 = layout.rows?.[0] || [];
+    const row2 = layout.rows?.[1] || [];
+    const sourceId = row1.find((s: any) => s.nodeId === 'flow_control')?.id;
+    const targetId = row2.find((s: any) => s.nodeId === 'message_parsing')?.id;
+    if (!sourceId || !targetId) {
+      setCrossRowPath(null);
+      return;
+    }
+
+    const elFrom = flowCardRefs.current.get(sourceId);
+    const elTo = flowCardRefs.current.get(targetId);
+    if (!elFrom || !elTo) {
+      setCrossRowPath(null);
+      return;
+    }
+
+    const r1 = elFrom.getBoundingClientRect();
+    const r2 = elTo.getBoundingClientRect();
+
+    // 起点：第一行“流程控制”卡片底部中心
+    const x1 = r1.left - rectC.left + r1.width / 2;
+    const y1 = r1.bottom - rectC.top;
+    // 终点：第二行“信号解析”卡片顶部中心
+    const x2 = r2.left - rectC.left + r2.width / 2;
+    const y2 = r2.top - rectC.top;
+
+    // 走线：先下，再左/右，再下（折线路径）
+    const yMid = Math.min(rectC.height - 1, Math.max(0, y1 + 26));
+    const path = `M ${x1} ${y1} L ${x1} ${yMid} L ${x2} ${yMid} L ${x2} ${y2}`;
+    setCrossRowPath(path);
+  }, [buildCanonicalWorkflowRows]);
+
+  React.useLayoutEffect(() => {
+    recomputeCrossRowPath();
+    const onResize = () => recomputeCrossRowPath();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [recomputeCrossRowPath, selectedStep, status, analysisData, workflowTrace]);
+
+  const renderWorkflowCard = (step: any, opts?: { fixedWidth?: number }) => {
+    const StepIcon = step.icon;
+    const isActive = step.status === 'active';
+    const isCompleted = step.status === 'completed';
+    const isFailed = step.status === 'failed';
+    const isSelected = selectedStep === step.id;
+    const fixedWidth = opts?.fixedWidth ?? 152;
+
+    const baseStyle: CSSProperties = {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '8px',
+      padding: '12px 16px',
+      background: isFailed ? '#fff1f0' : isSelected ? '#e6f7ff' : 'white',
+      border: `2px solid ${isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8'}`,
+      borderRadius: '8px',
+      boxShadow: isSelected ? '0 4px 12px rgba(44, 90, 160, 0.15)' : '0 2px 8px rgba(0,0,0,0.08)',
+      cursor: 'pointer',
+      transition: 'all 0.2s',
+      position: 'relative',
+      flexShrink: 0,
+      width: fixedWidth
+    };
+
+    return (
+      <div
+        key={step.id}
+        ref={(el) => {
+          if (el) flowCardRefs.current.set(step.id, el);
+          else flowCardRefs.current.delete(step.id);
+        }}
+        style={baseStyle}
+        onClick={() => setSelectedStep(step.id)}
+        onMouseEnter={(e) => {
+          if (!isSelected) {
+            e.currentTarget.style.transform = 'translateY(-2px)';
+            e.currentTarget.style.boxShadow = '0 4px 12px rgba(44, 90, 160, 0.15)';
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (!isSelected) {
+            e.currentTarget.style.transform = 'translateY(0)';
+            e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.08)';
+          }
+        }}
+      >
+        <StepIcon
+          style={{
+            fontSize: '20px',
+            color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c'
+          }}
+        />
+        <span
+          style={{
+            fontSize: '14px',
+            color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c',
+            fontWeight: isActive ? '500' : '400',
+            whiteSpace: 'nowrap'
+          }}
+        >
+          {step.name}
+        </span>
+
+        {/* 多轮执行徽标：改为角标，避免撑开卡片宽度影响对齐 */}
+        {step.runIndex && (
+          <Tag
+            color="#2c5aa0"
+            style={{
+              marginRight: 0,
+              fontSize: '11px',
+              lineHeight: '16px',
+              padding: '0 6px',
+              height: '18px',
+              position: 'absolute',
+              top: '-8px',
+              right: '-8px'
+            }}
+          >
+            第{step.runIndex}轮
+          </Tag>
+        )}
+
+        {isCompleted && (
+          <CheckCircleOutlined
+            style={{
+              fontSize: '16px',
+              color: '#52c41a',
+              position: 'absolute',
+              bottom: '-6px',
+              right: '-6px',
+              background: 'white',
+              borderRadius: '50%'
+            }}
+          />
+        )}
+        {isFailed && (
+          <CloseCircleOutlined
+            style={{
+              fontSize: '16px',
+              color: '#ff4d4f',
+              position: 'absolute',
+              bottom: '-6px',
+              right: '-6px',
+              background: 'white',
+              borderRadius: '50%'
+            }}
+          />
+        )}
+      </div>
+    );
+  };
+
+  const renderWorkflowRow = (rowSteps: any[], opts?: { withLeadingConnector?: boolean; fixedWidth?: number }) => {
+    const withLeadingConnector = Boolean(opts?.withLeadingConnector);
+    const fixedWidth = opts?.fixedWidth ?? 152;
+    const connectorStyle = (statusColor: string): CSSProperties => ({
+      width: '24px',
+      height: '2px',
+      background: statusColor,
+      transition: 'all 0.3s',
+      flexShrink: 0
+    });
+
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0px' }}>
+        {rowSteps.map((step, idx) => {
+          const isActive = step.status === 'active';
+          const isCompleted = step.status === 'completed';
+          const isFailed = step.status === 'failed';
+          const lineColor = isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8';
+
+          return (
+            <React.Fragment key={step.id}>
+              {(withLeadingConnector || idx > 0) && <div style={connectorStyle(lineColor)} />}
+              {renderWorkflowCard(step, { fixedWidth })}
+            </React.Fragment>
+          );
+        })}
+      </div>
+    );
+  };
+
   // 获取步骤的详细信息
   const getStepDetails = (stepId: string) => {
     // 若点击的是某一轮 run（nodeId::run:N），优先展示“该轮的 trace 信息”，避免被写死的分支覆盖
@@ -1118,7 +1402,7 @@ const ChargingPage = () => {
     if (parsed.runIndex) {
       const trace = getTraceEntry(stepId);
       return {
-        title: `${trace?.name || parsed.nodeId}（第${parsed.runIndex}轮）`,
+        title: `${canonicalNodeDisplayName(parsed.nodeId)}（第${parsed.runIndex}轮）`,
         data: {
           trace
         }
@@ -1140,7 +1424,7 @@ const ChargingPage = () => {
     // 其他步骤需要 analysisData，如果没有则返回空数据
     if (!analysisData) {
       return {
-        title: stepId === 'message_parsing' ? '报文解析' : 
+        title: stepId === 'message_parsing' ? '信号解析' : 
               stepId === 'report_generation' ? '报告生成' : '详细信息',
         data: {}
       };
@@ -1165,7 +1449,7 @@ const ChargingPage = () => {
         }
       },
       message_parsing: {
-        title: '报文解析',
+        title: '信号解析',
         data: analysisData.data_stats ? {
           dataStats: analysisData.data_stats,
           signalCount: analysisData.data_stats.signal_count || 0,
@@ -1192,7 +1476,7 @@ const ChargingPage = () => {
         }
       },
       rag_retrieval: {
-        title: 'RAG检索',
+        title: '知识检索',
         data: {
           retrievedDocuments: analysisData.retrieved_documents || [],
           retrievalContext: analysisData.retrieval_context || '',
@@ -1956,7 +2240,7 @@ const ChargingPage = () => {
         {file && (
           <div style={{ 
             display: 'flex', 
-            alignItems: 'center', 
+            alignItems: 'flex-start', 
             gap: '12px',
             marginTop: '0',
             marginBottom: '24px',
@@ -1971,7 +2255,9 @@ const ChargingPage = () => {
             overflowY: 'visible',
             minWidth: '100%',
             boxSizing: 'border-box'
-          }}>
+          }}
+          onScroll={() => recomputeCrossRowPath()}
+          >
             {/* 文件卡片 */}
             <div style={{
               display: 'flex',
@@ -2033,107 +2319,78 @@ const ChargingPage = () => {
               )}
             </div>
 
-            {/* 动态流程卡片 */}
-            {getCurrentSteps().slice(1).map((step, index) => {
-              const StepIcon = step.icon;
-              const isActive = step.status === 'active';
-              const isCompleted = step.status === 'completed';
-              const isFailed = step.status === 'failed';
-              const isSelected = selectedStep === step.id;
-              
-              return (
-                <React.Fragment key={step.id}>
-                  {/* 连接线 */}
-                  <div style={{
-                    width: '24px',
-                    height: '2px',
-                    background: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8',
-                    transition: 'all 0.3s',
-                    flexShrink: 0
-                  }} />
-                  
-                  {/* 流程卡片 */}
-                  <div style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '8px',
-                    padding: '12px 16px',
-                    background: isFailed ? '#fff1f0' : isSelected ? '#e6f7ff' : 'white',
-                    border: `2px solid ${isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#e8e8e8'}`,
-                    borderRadius: '8px',
-                    boxShadow: isSelected ? '0 4px 12px rgba(44, 90, 160, 0.15)' : '0 2px 8px rgba(0,0,0,0.08)',
-                    cursor: 'pointer',
-                    transition: 'all 0.2s',
-                    position: 'relative',
-                    flexShrink: 0
-                  }}
-                  onClick={() => setSelectedStep(step.id)}
-                  onMouseEnter={(e) => {
-                    if (!isSelected) {
-                      e.currentTarget.style.transform = 'translateY(-2px)';
-                      e.currentTarget.style.boxShadow = '0 4px 12px rgba(44, 90, 160, 0.15)';
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isSelected) {
-                      e.currentTarget.style.transform = 'translateY(0)';
-                      e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.08)';
-                    }
-                  }}
-                  >
-                    <StepIcon style={{ 
-                      fontSize: '20px', 
-                      color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c'
-                    }} />
-                    <span style={{ 
-                      fontSize: '14px', 
-                      color: isFailed ? '#ff4d4f' : isCompleted ? '#52c41a' : isActive ? '#2c5aa0' : '#8c8c8c',
-                      fontWeight: isActive ? '500' : '400',
-                      whiteSpace: 'nowrap'
-                    }}>
-                      {step.name}
-                    </span>
-                    {/* 多轮执行的徽标（例如 flow_control::run:2） */}
-                    {step.runIndex && (
-                      <Tag
-                        color="#2c5aa0"
-                        style={{
-                          marginRight: 0,
-                          fontSize: '11px',
-                          lineHeight: '16px',
-                          padding: '0 6px',
-                          height: '18px'
-                        }}
-                      >
-                        第{step.runIndex}轮
-                      </Tag>
-                    )}
-                    {isCompleted && (
-                      <CheckCircleOutlined style={{ 
-                        fontSize: '16px', 
-                        color: '#52c41a',
-                        position: 'absolute',
-                        top: '-6px',
-                        right: '-6px',
-                        background: 'white',
-                        borderRadius: '50%'
-                      }} />
-                    )}
-                    {isFailed && (
-                      <CloseCircleOutlined style={{
-                        fontSize: '16px',
-                        color: '#ff4d4f',
-                        position: 'absolute',
-                        top: '-6px',
-                        right: '-6px',
-                        background: 'white',
-                        borderRadius: '50%'
-                      }} />
-                    )}
+            {/* 规范流程卡片（支持 ReAct 第二轮两行 10 卡片） */}
+            {(() => {
+              const hasTrace = analysisData && Object.keys(workflowTrace || {}).length > 0;
+              const layout = hasTrace ? buildCanonicalWorkflowRows() : null;
+
+              // 统一卡片宽度，便于第二行对齐到“第一行的信号解析”下方
+              const CARD_W = 152;
+              const LINE_W = 24;
+              const indentToSecondCard = LINE_W + CARD_W + LINE_W; // 连接线 + 第一张卡 + 连接线
+
+              // 无 trace 时，继续沿用 fallback（保持“分析中不空白”），但已换成新的命名/顺序
+              if (!layout) {
+                return getCurrentSteps()
+                  .slice(1)
+                  .map((step) => (
+                    <React.Fragment key={step.id}>
+                      <div style={{ width: '24px', height: '2px', background: '#e8e8e8', transition: 'all 0.3s', flexShrink: 0 }} />
+                      {renderWorkflowCard(step, { fixedWidth: CARD_W })}
+                    </React.Fragment>
+                  ));
+              }
+
+              if (layout.mode === 'single') {
+                return (
+                  <div ref={flowContainerRef} style={{ position: 'relative', overflow: 'visible' }}>
+                    {renderWorkflowRow(layout.rows[0], { withLeadingConnector: true, fixedWidth: CARD_W })}
                   </div>
-                </React.Fragment>
+                );
+              }
+
+              // two_row
+              return (
+                <div
+                  ref={flowContainerRef}
+                  style={{
+                    position: 'relative',
+                    overflow: 'visible',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '14px',
+                    paddingBottom: '6px'
+                  }}
+                >
+                  {/* 跨行连线 SVG（流程控制 -> 第二行信号解析） */}
+                  <svg
+                    width={flowSvgSize.w}
+                    height={flowSvgSize.h}
+                    style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', overflow: 'visible' }}
+                  >
+                    <defs>
+                      <marker id="arrowHead" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                        <path d="M0,0 L0,6 L6,3 z" fill="#2c5aa0" />
+                      </marker>
+                    </defs>
+                    {crossRowPath && (
+                      <path
+                        d={crossRowPath}
+                        stroke="#2c5aa0"
+                        strokeWidth="2"
+                        fill="none"
+                        markerEnd="url(#arrowHead)"
+                      />
+                    )}
+                  </svg>
+
+                  {renderWorkflowRow(layout.rows[0], { withLeadingConnector: true, fixedWidth: CARD_W })}
+                  <div style={{ marginLeft: indentToSecondCard }}>
+                    {renderWorkflowRow(layout.rows[1], { withLeadingConnector: false, fixedWidth: CARD_W })}
+                  </div>
+                </div>
               );
-            })}
+            })()}
           </div>
         )}
 
