@@ -30,7 +30,23 @@ from database import init_db
 from routers import analyses, auth, rag, training
 
 settings = get_settings()
-logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+# 说明：
+# - 本项目常用 `uvicorn main:app` 启动，uvicorn 会先配置自己的 logging。
+# - 这会导致这里的 basicConfig 有时“不生效”，从而看不到应用模块的 logger.info。
+# - 下面做一次“兜底桥接”：把 uvicorn.error 的 handlers 挂到 root logger，确保应用日志可见。
+logging.basicConfig(level=_level)
+try:
+    uvicorn_logger = logging.getLogger("uvicorn.error")
+    root = logging.getLogger()
+    if uvicorn_logger.handlers:
+        for h in uvicorn_logger.handlers:
+            if h not in root.handlers:
+                root.addHandler(h)
+    root.setLevel(_level)
+except Exception:
+    # 不影响服务启动：只做日志兜底
+    pass
 
 # 抑制遥测相关的日志（设置为 CRITICAL 以完全隐藏错误消息）
 logging.getLogger("backoff").setLevel(logging.CRITICAL)
