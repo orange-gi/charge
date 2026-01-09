@@ -5,6 +5,7 @@ from functools import lru_cache
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 # 在导入 chromadb 之前禁用遥测
@@ -108,15 +109,68 @@ def _get_embedder():
     from sentence_transformers import SentenceTransformer
 
     settings = get_settings()
-    # 优先使用本地模型路径，如果路径存在且有效，则使用本地路径
-    # 否则使用模型名称（会从 HuggingFace 或其他源下载）
-    if settings.bge_model_path and settings.bge_model_path.exists():
-        model_path = str(settings.bge_model_path.resolve())
-        logger.info(f"使用本地 BGE 模型路径: {model_path}")
+
+    def _looks_like_windows_path(s: str) -> bool:
+        raw = (s or "").strip()
+        # 典型形式：D:\xxx 或 D:/xxx
+        return len(raw) >= 3 and raw[1] == ":" and (raw[2] == "\\" or raw[2] == "/")
+
+    def _has_model_weights(p: Path) -> bool:
+        # HuggingFace Transformers 常见权重文件（根目录）
+        root_candidates = [
+            p / "pytorch_model.bin",
+            p / "model.safetensors",
+            p / "tf_model.h5",
+            p / "model.ckpt.index",
+            p / "flax_model.msgpack",
+        ]
+        if any(c.exists() for c in root_candidates):
+            return True
+        # sentence-transformers 常见结构：0_Transformer/xxx
+        st_candidates = [
+            p / "0_Transformer" / "pytorch_model.bin",
+            p / "0_Transformer" / "model.safetensors",
+            p / "0_Transformer" / "tf_model.h5",
+        ]
+        if any(c.exists() for c in st_candidates):
+            return True
+        return False
+
+    # 1) 若显式配置了 BGE_MODEL_PATH，则严格按该路径加载（并校验权重存在）
+    env_bge_path = (os.environ.get("BGE_MODEL_PATH") or "").strip()
+    if env_bge_path:
+        p = Path(env_bge_path).expanduser()
+        if not p.exists():
+            raise RuntimeError(f"BGE_MODEL_PATH 指向的目录不存在：{p}")
+        if not _has_model_weights(p):
+            raise RuntimeError(
+                f"BGE_MODEL_PATH 指向的目录缺少模型权重文件：{p}。"
+                f"需要包含如 pytorch_model.bin / model.safetensors（或 sentence-transformers 的 0_Transformer/* 权重）。"
+            )
+        model_path = str(p.resolve())
+        logger.info(f"使用本地 BGE 模型路径(BGE_MODEL_PATH): {model_path}")
         return SentenceTransformer(model_path)
-    else:
-        logger.info(f"使用 BGE 模型名称: {settings.bge_model_name}")
-        return SentenceTransformer(settings.bge_model_name)
+
+    # 2) 未显式配置 BGE_MODEL_PATH：仅当默认路径“真的像一个可用模型目录”时才使用
+    if settings.bge_model_path and settings.bge_model_path.exists():
+        p = Path(settings.bge_model_path).expanduser()
+        if _has_model_weights(p):
+            model_path = str(p.resolve())
+            logger.info(f"使用本地 BGE 模型路径(默认): {model_path}")
+            return SentenceTransformer(model_path)
+        logger.warning(
+            f"检测到默认 BGE_MODEL_PATH 目录存在但不包含权重文件，将忽略并回退到 BGE_MODEL_NAME。path={p}"
+        )
+
+    # 3) 使用 BGE_MODEL_NAME（可为 HF 仓库名或本地路径）
+    model_name_or_path = str(settings.bge_model_name or "").strip()
+    if os.name != "nt" and _looks_like_windows_path(model_name_or_path):
+        logger.warning(
+            "当前运行环境为非 Windows，但 BGE_MODEL_NAME 看起来是 Windows 路径："
+            f"{model_name_or_path}。若你在 Docker/Linux 里运行，需要把模型目录挂载到容器内，并用 BGE_MODEL_PATH 指向容器内路径。"
+        )
+    logger.info(f"使用 BGE 模型名称/路径(BGE_MODEL_NAME): {model_name_or_path}")
+    return SentenceTransformer(model_name_or_path)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
