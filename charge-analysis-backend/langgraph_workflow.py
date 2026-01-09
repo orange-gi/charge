@@ -2082,7 +2082,9 @@ class ChargingAnalysisWorkflow:
         self.graph.add_node("flow_control", flow_control.process)
         self.graph.add_node("rag_retrieval", rag_retrieval.process)
         self.graph.add_node("detailed_analysis", detailed_analysis.process)
-        self.graph.add_node("llm_analysis", llm_analysis.process)
+        # 注意：langgraph 不允许“节点名”与“state key”同名；state 里已有 llm_analysis 字段
+        # 为了不破坏接口字段/前端展示（仍使用 llm_analysis），这里仅改节点名
+        self.graph.add_node("llm_analysis_node", llm_analysis.process)
         self.graph.add_node("report_generation", report_generation.process)
         
         # 添加边
@@ -2097,10 +2099,12 @@ class ChargingAnalysisWorkflow:
             self.should_continue_analysis,
             {
                 "flow_control": "flow_control",
-                "llm_analysis": "llm_analysis",
+                # should_continue_analysis 仍返回 "llm_analysis" 作为语义分支名
+                # 但实际跳转到不冲突的节点名 llm_analysis_node
+                "llm_analysis": "llm_analysis_node",
             },
         )
-        self.graph.add_edge("llm_analysis", "report_generation")
+        self.graph.add_edge("llm_analysis_node", "report_generation")
         self.graph.add_edge("report_generation", END)
     
     async def execute(self, initial_state: ChargingAnalysisState) -> ChargingAnalysisState:
